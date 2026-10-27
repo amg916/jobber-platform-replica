@@ -10,7 +10,7 @@ export function scheduleVisit(repo,id,input) { return transaction(repo.db,()=>{
  const [start,end]=interval(input.scheduled_start||visit.scheduled_start,input.scheduled_end||visit.scheduled_end);
  const ids=teamIds(repo,input.assigned_user_ids_json??visit.assigned_user_ids_json);
  if(conflicts(repo,start,end,ids,{entity_type:'visit',entity_id:id}).length) fail('Schedule conflict',409);
- const updated=repo.update('visits',id,{scheduled_start:start,scheduled_end:end,assigned_user_ids_json:ids,status:'scheduled'});
+ const updated=repo.update('visits',id,{scheduled_start:start,scheduled_end:end,occurrence_start:visit.occurrence_start||visit.scheduled_start||start,assigned_user_ids_json:ids,status:'scheduled'});
  const data={entity_type:'visit',entity_id:id,title:visit.title,start_at:start,end_at:end,assigned_user_ids_json:ids,status:'scheduled',color:'#2f7d50'};
  const existing=repo.list('appointments',{entity_type:'visit',entity_id:id})[0]; if(existing) repo.update('appointments',existing.id,data); else repo.insert('appointments',data);
  return updated;
@@ -21,6 +21,7 @@ export function generateVisits(repo,ruleId) { return transaction(repo.db,()=>{
  const count=rule.occurrence_count||52; if(count>1000||count<1) fail('Occurrence count must be 1–1000');
  const step=rule.interval_count||1; if(step<1) fail('Invalid recurrence interval');
  const days=JSON.parse(rule.days_of_week_json||'[]'); if(!Array.isArray(days)||days.some(d=>!Number.isInteger(d)||d<0||d>6)) fail('Invalid weekdays');
+ const byOccurrence=new Map();for(const v of repo.list('visits',{job_id:job.id})){const key=v.occurrence_start||v.scheduled_start;if(key&&!byOccurrence.has(key))byOccurrence.set(key,v);}
  const result=[]; let matched=0;
  for(let offset=0;offset<36600 && matched<count;offset++) {
   const date=new Date(+base+offset*86400000),dateText=date.toISOString().slice(0,10); if(rule.until_date && dateText>rule.until_date) break;
@@ -30,9 +31,10 @@ export function generateVisits(repo,ruleId) { return transaction(repo.db,()=>{
   else { const weeks=rule.frequency==='biweekly'?2:1; use=Math.floor(offset/7)%(weeks*step)===0 && (days.length?days:[base.getUTCDay()]).includes(date.getUTCDay()); }
   if(!use) continue; matched++;
   const start=new Date(`${dateText}T${job.start_time||'09:00'}:00Z`).toISOString();
-  const existing=repo.list('visits',{job_id:job.id,scheduled_start:start})[0]; if(existing) { result.push(existing); continue; }
-  const visit=repo.insert('visits',{job_id:job.id,client_id:job.client_id,property_id:job.property_id,title:job.title,status:'unscheduled',billable_amount_cents:job.total_cents});
-  result.push(scheduleVisit(repo,visit.id,{scheduled_start:start,scheduled_end:new Date(Date.parse(start)+(rule.duration_minutes||60)*60000).toISOString(),assigned_user_ids_json:job.assigned_user_ids_json}));
+  let existing=byOccurrence.get(start); if(existing) { if(!existing.occurrence_start)existing=repo.update('visits',existing.id,{occurrence_start:start}); byOccurrence.set(start,existing); result.push(existing); continue; }
+  const visit=repo.insert('visits',{job_id:job.id,client_id:job.client_id,property_id:job.property_id,title:job.title,status:'unscheduled',occurrence_start:start,billable_amount_cents:job.total_cents});
+  const scheduled=scheduleVisit(repo,visit.id,{scheduled_start:start,scheduled_end:new Date(Date.parse(start)+(rule.duration_minutes||60)*60000).toISOString(),assigned_user_ids_json:job.assigned_user_ids_json});
+  byOccurrence.set(start,scheduled); result.push(scheduled);
  }
  return result;
  }); }

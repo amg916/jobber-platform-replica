@@ -21,7 +21,7 @@ export const definitions = {
  quote_line_items: 'organization_id! quote_id! product_service_id name! description quantity# unit unit_cost_cents$ markup_percent# unit_price_cents$ total_cents$ is_optional? is_selected? taxable? sort_order$',
  jobs: 'organization_id! client_id! property_id quote_id request_id job_number title! instructions status=active|requires_invoicing|action_required|late|on_hold|completed|archived|unscheduled job_type=one_off|recurring billing_type=upon_completion|visit_based|fixed_price|monthly start_date end_date start_time end_time assigned_user_ids_json subtotal_cents$ tax_cents$ total_cents$ labor_cost_cents$ expense_cost_cents$ profit_cents$ internal_notes created_at updated_at',
  recurrence_rules: 'organization_id! job_id! frequency=daily|weekly|biweekly|monthly interval_count$ days_of_week_json day_of_month$ start_date! until_date occurrence_count$ duration_minutes$ auto_invoice?',
- visits: 'organization_id! job_id! client_id! property_id title! instructions status=scheduled|unscheduled|in_progress|completed|late|cancelled scheduled_start scheduled_end anytime? assigned_user_ids_json completed_at completed_by_user_id completion_notes billable_amount_cents$ invoiced? invoice_id created_at',
+ visits: 'organization_id! job_id! client_id! property_id title! instructions status=scheduled|unscheduled|in_progress|completed|late|cancelled scheduled_start scheduled_end occurrence_start anytime? assigned_user_ids_json completed_at completed_by_user_id completion_notes billable_amount_cents$ invoiced? invoice_id created_at',
  appointments: 'organization_id! entity_type=visit|assessment|task entity_id! title start_at end_at assigned_user_ids_json color status',
  tasks: 'organization_id! client_id job_id title! instructions due_date start_time end_time assigned_user_id status=open|completed completed_at created_at',
  checklists: 'organization_id! job_id visit_id title!',
@@ -71,6 +71,8 @@ export function migrate(db) {
   }
   db.exec(`CREATE TABLE IF NOT EXISTS ${table} (${parts.join(',')}) STRICT`);
  }
+ if(!db.prepare('PRAGMA table_info(visits)').all().some(c=>c.name==='occurrence_start'))db.exec('ALTER TABLE visits ADD COLUMN occurrence_start TEXT');
+ db.exec('UPDATE visits SET occurrence_start=scheduled_start WHERE occurrence_start IS NULL AND scheduled_start IS NOT NULL');
  if(!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='website'))db.exec('ALTER TABLE organizations ADD COLUMN website TEXT');
  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS org_slug ON organizations(slug);
  CREATE UNIQUE INDEX IF NOT EXISTS session_token ON sessions(token);
