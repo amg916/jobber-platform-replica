@@ -1,9 +1,9 @@
 import { fail, transaction } from '../db/database.js';
-export function teamIds(repo, ids=[]) { if(typeof ids==='string') { try { ids=JSON.parse(ids); } catch { fail('Invalid team'); } } if(!Array.isArray(ids)) fail('Expected team array'); for(const id of ids) { if(!Number.isSafeInteger(id)||!repo.get('users',id).is_active) fail('Inactive team member'); } return [...new Set(ids)]; }
+export function teamIds(repo, ids=[]) { if(typeof ids==='string') { try { ids=JSON.parse(ids); } catch { fail('Invalid team'); } } if(!Array.isArray(ids)) fail('Expected team array'); ids=[...new Set(ids)]; for(const id of ids) { if(!Number.isSafeInteger(id)||!repo.get('users',id).is_active) fail('Inactive team member'); } return [...new Set(ids)]; }
 export function interval(start,end) { const a=Date.parse(start),b=Date.parse(end); if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a) fail('Invalid schedule interval'); return [new Date(a).toISOString(),new Date(b).toISOString()]; }
 export function conflicts(repo,start,end,ids,exclude={}) {
- [start,end]=interval(start,end); ids=teamIds(repo,ids);
- return repo.list('appointments').filter(a=>a.status!=='cancelled' && !(a.entity_type===exclude.entity_type && a.entity_id===exclude.entity_id) && a.start_at<end && a.end_at>start && JSON.parse(a.assigned_user_ids_json||'[]').some(id=>ids.includes(id)));
+ [start,end]=interval(start,end); const team=new Set(teamIds(repo,ids));
+ return repo.list('appointments').filter(a=>a.status!=='cancelled' && !(a.entity_type===exclude.entity_type && a.entity_id===exclude.entity_id) && a.start_at<end && a.end_at>start && JSON.parse(a.assigned_user_ids_json||'[]').some(id=>team.has(id)));
 }
 export function scheduleVisit(repo,id,input) { return transaction(repo.db,()=>{
  const visit=repo.get('visits',id); if(['completed','cancelled'].includes(visit.status)) fail('Visit cannot be rescheduled');

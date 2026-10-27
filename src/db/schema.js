@@ -85,6 +85,7 @@ export function migrate(db) {
  CREATE UNIQUE INDEX IF NOT EXISTS appointment_entity ON appointments(organization_id,entity_type,entity_id);
  CREATE UNIQUE INDEX IF NOT EXISTS booking_code ON online_bookings(confirmation_code);
  CREATE UNIQUE INDEX IF NOT EXISTS active_clock ON time_entries(organization_id,user_id) WHERE end_at IS NULL;
+ CREATE INDEX IF NOT EXISTS automation_event ON automations(organization_id,trigger_event,is_enabled);
  CREATE INDEX IF NOT EXISTS execution_queue ON automation_executions(status,scheduled_for);`);
  for (const [t, c] of Object.entries(columns)) if(c.includes('organization_id')) db.exec(`CREATE INDEX IF NOT EXISTS ${t}_tenant ON ${t}(organization_id)`);
 }

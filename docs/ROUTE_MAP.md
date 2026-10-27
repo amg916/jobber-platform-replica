@@ -22,4 +22,39 @@ Settings sections: company/business-profile, client-hub, requests-and-bookings/o
 - `/api/public/booking/<slug>`, `/api/public/requests/<slug>`, `/api/client-hub/<token>` and scoped portal actions.
 - `/api/ai/*`: deterministic local simulations; `/api/health` reports local mode.
 
-Authenticated requests use a Bearer session token. Resource access is mapped to role permissions, then repository operations constrain organization IDs. Public portal requests use a client token instead of a workspace session.
+Authenticated requests accept Bearer, `X-Jobber-Token`, or `_jobber_session` cookie tokens. Cookie writes require `X-CSRF-Token` obtained from `GET /api/csrf`. Login/bootstrap set HttpOnly/SameSite=Lax cookies; logout clears them. Resource access is mapped to role permissions, then repository operations constrain organization IDs. Public portal requests use a client token instead of a workspace session.
+
+## Developer GraphQL and OAuth
+
+- `GET/POST /api/graphql`, `GET/POST /graphql`: authenticated query execution; mutations require POST. Version header `X-JOBBER-GRAPHQL-VERSION` is echoed, defaulting to `2025-01-20`.
+- GraphQL `scheduledItems`: `ScheduledItemConnection` combining Visit, Assessment and Task nodes, with type-prefixed pagination cursors and schedule read permission. `Job.lineItems`: `JobLineItemConnection` using selected quote lines or a synthesized job-total line, requiring Job read permission.
+- `GET/POST /api/oauth/authorize`, `/oauth/authorize`: authenticated code issuance; `client_id`, `response_type=code`, optional redirect URI/state. HTML-preferred requests redirect; other requests receive JSON.
+- `POST /api/oauth/token`, `/oauth/token`: JSON or form-encoded authorization_code, refresh_token, password, client_credentials grants. Client credentials require application-configured clients; code/refresh exchanges bind the client ID. Codes last ten minutes; session access tokens last one day; refresh grants last thirty days and rotate.
+- `GET /api/csrf`: session-bound token, or a public token when no session is supplied.
+
+## Rails JSON normalization
+
+All routes below are authenticated and use the same REST handlers. Resource item routes retain their IDs; standard POST/PATCH/PUT/DELETE semantics remain unchanged.
+
+| Rails path family | REST destination |
+| --- | --- |
+| clients, properties, requests, quotes, jobs, visits, invoices, payments, expenses, tasks `.json` | matching `/api/<resource>` |
+| work_requests | requests |
+| work_orders | jobs |
+| time_sheet_entries, timesheets | time-entries |
+| products_and_services | catalog |
+| quotes/:id/send_quote or send | quotes/:id/send |
+| quotes/:id/approve | quotes/:id/approve |
+| quotes/:id/request_changes | quotes/:id/request-changes |
+| quotes/:id/convert_to_job | quotes/:id/job |
+| jobs/:id/visits | jobs/:id/visit |
+| jobs/:id/complete | jobs/:id/complete |
+| jobs/:id/generate_invoice or invoice | jobs/:id/invoice |
+| visits/:id/complete or reschedule | matching workflow action |
+| invoices/:id/send_invoice or issue | invoices/:id/issue |
+| invoices/:id/record_payment | invoice-bound payment workflow; client derived from invoice |
+| payments/:id/refund | payments/:id/refund |
+| calendar/events, schedule/events | schedule |
+| work_objects | work_objects; requests/quotes/jobs/invoices, optional `q` |
+
+`/api/work_objects` is also available. `/reference-icons.json` and `/assets/` paths retain static behavior without Rails rewriting; `/assets/README.json` returns 404 rather than an API authentication error. Extensionless `/clients`, `/quotes`, `/work_requests` and other browser navigation paths still return HTML.
