@@ -1,0 +1,13 @@
+{
+  "logo_mask_url": "https://cdn.jobber.com/yr/logos/v1/logo_jobber_bug.svg",
+  "home_card_image": "/assets_remix/truck-outline-beige-BlCeOD9E.webp",
+  "home_card_embedded_image": "Keys to Growth logo saved as home_keys_to_growth.webp",
+  "clients_card_image": "/assets_remix/clientMergeCard-DThn2WLm.webp",
+  "requests_card_image": "/assets_remix/FTU%20Image-BL8SxJhc.webp",
+  "requests_decorative_svg_outerHTML": "requests_track_client_request.svg",
+  "clients_promo_uses_svg": false,
+  "home_truck_promo_uses_svg": false,
+  "home_close_button_svg": "home_card_close.svg",
+  "requests_torn_edge_svg": "requests_torn_edge.svg",
+  "requests_close_button_svg": "requests_card_close.svg"
+}
