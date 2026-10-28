@@ -2,7 +2,7 @@
 
 ## Live data and minimal seed
 
-- `seedDatabase` seeds only the `J S Custom Tile` organization (`id: 1`), 4 RBAC roles (`owner`, `admin`, `dispatcher`, `technician`), 120 role permissions, and 4 team members (`Jack Surwald`, `Anthony`, `Tasha`, `David`). Zero dummy clients, requests, quotes, jobs, invoices, payments, expenses, subscription payments, appointments, time entries, campaigns, notifications, or messages are seeded.
+- `seedDatabase` seeds only the `J S Custom Tile` organization (`id: 1`), 4 RBAC roles (`owner`, `dispatcher`, `technician`, `limited`), 120 role permissions, and 4 team members (`Jack Surwald`, `Kyle Waterworth`, `Roger Burton`, `William Houn`). Zero dummy clients, requests, quotes, jobs, invoices, payments, expenses, subscription payments, appointments, time entries, campaigns, notifications, or messages are seeded.
 - All business screens, Home workflow cards, today's appointment metrics (evaluated in the organization's configured timezone), receivables, upcoming jobs, list statistics, client tags/properties, campaigns, and automation execution counts are 100% live-wired to the SQLite database via REST and GraphQL (`2025-01-20`).
 - Date defaults and time-of-day greetings (`Good morning`, `Good afternoon`, `Good evening`) use the current runtime clock.
 - Quotes expose salesperson assignment/filtering; expenses expose review status (`reviewed` / `pending`) and accounting codes; Requests, Quotes, Jobs, and Invoices support explicit property selection (`property_id`) with automatic fallback to the client's primary property; Company Settings persists both `address` (`Street 1`) and `address_line2` (`Street 2`).

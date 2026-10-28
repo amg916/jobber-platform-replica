@@ -1309,10 +1309,14 @@ test('tightening loop: address_line2 persistence, builder property_id, 30-day/7-
  assert.ok(db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='address_line2'));
  assert.equal((await request('settings','PATCH',{address:'100 Main St',address_line2:'Suite 200'})).status,200);
  assert.equal((await request('settings')).body.address_line2,'Suite 200');
+ const ab=(await request('account-billing')).body;
+ assert.equal(ab.status,'Active');assert.match(ab.billing_address,/Suite 200/);
  const portal=(await request('clients/1/portal')).body;
  assert.equal((await request('client-hub/'+portal.token)).body.organization.address_line2,'Suite 200');
- const p2=r.insert('properties',{client_id:1,street1:'250 Second Ave',city:'Gold River',state:'CA',postal_code:'95670',country:'United States',is_primary:0});
- const h=domHarness();h.run(`user={id:1,name:'Jack Surwald'};org={name:'J S Custom Tile',address:'100 Main St',address_line2:'Suite 200'};clients=[{id:1,display_name:'Client 1'}];cache.properties=[{id:1,client_id:1,street1:'100 Main St',city:'Gold River',state:'CA'},{id:${p2.id},client_id:1,street1:'250 Second Ave',city:'Gold River',state:'CA'}];render=async()=>{};`);
+ const p2=r.insert('properties',{client_id:1,street1:'250 Second Ave',street2:'Unit B',city:'Gold River',state:'CA',postal_code:'95670',country:'United States',is_primary:0});
+ const h=domHarness();h.run(`user={id:1,name:'Jack Surwald'};org={name:'J S Custom Tile',address:'100 Main St',address_line2:'Suite 200'};clients=[{id:1,display_name:'Client 1'}];cache.properties=[{id:1,client_id:1,street1:'100 Main St',city:'Gold River',state:'CA'},{id:${p2.id},client_id:1,street1:'250 Second Ave',street2:'Unit B',city:'Gold River',state:'CA'}];render=async()=>{};`);
+ assert.match(h.run(`propertyAddress({client_id:1,property_id:${p2.id}})`),/250 Second Ave, Unit B, Gold River, CA/);
+ await h.click({addClientProperty:'1'});assert.match(h.elements.get('#overlay').innerHTML,/name="street2"/);
  const companyHtml=await h.run("settings('company')");
  assert.match(companyHtml,/name="address_line2"[^>]*>Suite 200<\/textarea>/);
  for(const type of ['requests','quotes','jobs','invoices']){
