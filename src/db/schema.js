@@ -4,7 +4,7 @@ export const definitions = {
  invoice_credits: 'organization_id! invoice_id! amount_cents$ reason created_at',
  preferences: 'organization_id! name! value_json',
  subscription_payments: 'organization_id! date! description! amount_cents$ receipt_number!',
- organizations: 'name! slug! email phone website address city state postal_code country timezone currency tax_name tax_rate# business_hours_json branding_color logo_url created_at',
+ organizations: 'name! slug! email phone website address address_line2 city state postal_code country timezone currency tax_name tax_rate# business_hours_json branding_color logo_url created_at',
  roles: 'organization_id! name! slug! is_system?',
  permissions: 'role_id! resource! action! allowed?',
  users: 'organization_id! role_id! name! email! password_hash! phone avatar_color hourly_cost# is_active? availability_json notification_prefs_json created_at',
@@ -89,6 +89,7 @@ export function migrate(db) {
  atomic(()=>!db.prepare('PRAGMA table_info(campaigns)').all().some(c=>c.name==='updated_at'),"ALTER TABLE campaigns ADD COLUMN updated_at TEXT");
  db.exec('UPDATE campaigns SET updated_at=COALESCE(sent_at,created_at) WHERE updated_at IS NULL');
  atomic(()=>!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='website'),"ALTER TABLE organizations ADD COLUMN website TEXT");
+ atomic(()=>!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='address_line2'),"ALTER TABLE organizations ADD COLUMN address_line2 TEXT");
  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS org_slug ON organizations(slug);
  CREATE UNIQUE INDEX IF NOT EXISTS session_token ON sessions(token);
  CREATE UNIQUE INDEX IF NOT EXISTS portal_token ON clients(portal_token) WHERE portal_token IS NOT NULL;

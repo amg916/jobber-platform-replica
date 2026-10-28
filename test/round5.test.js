@@ -1303,3 +1303,50 @@ test('round five artwork is served as JPEG with HEAD support',async t=>{
  }
  assert.equal((await fetch(server.url+'/assets/missing.jpg')).status,404);
 });
+test('tightening loop: address_line2 persistence, builder property_id, 30-day/7-day KPI windowing, dynamic greeting, and campaign job attribution',async t=>{
+ const {db,w,request}=await httpFixture(t),r=repository(db,1);
+ db.exec('ALTER TABLE organizations DROP COLUMN address_line2');migrate(db);migrate(db);
+ assert.ok(db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='address_line2'));
+ assert.equal((await request('settings','PATCH',{address:'100 Main St',address_line2:'Suite 200'})).status,200);
+ assert.equal((await request('settings')).body.address_line2,'Suite 200');
+ const portal=(await request('clients/1/portal')).body;
+ assert.equal((await request('client-hub/'+portal.token)).body.organization.address_line2,'Suite 200');
+ const p2=r.insert('properties',{client_id:1,street1:'250 Second Ave',city:'Gold River',state:'CA',postal_code:'95670',country:'United States',is_primary:0});
+ const h=domHarness();h.run(`user={id:1,name:'Jack Surwald'};org={name:'J S Custom Tile',address:'100 Main St',address_line2:'Suite 200'};clients=[{id:1,display_name:'Client 1'}];cache.properties=[{id:1,client_id:1,street1:'100 Main St',city:'Gold River',state:'CA'},{id:${p2.id},client_id:1,street1:'250 Second Ave',city:'Gold River',state:'CA'}];render=async()=>{};`);
+ const companyHtml=await h.run("settings('company')");
+ assert.match(companyHtml,/name="address_line2"[^>]*>Suite 200<\/textarea>/);
+ for(const type of ['requests','quotes','jobs','invoices']){
+  h.run("fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>path==='/api/clients'?[{id:1,display_name:'Client 1'}]:({id:9,client_id:1,property_id:"+p2.id+",title:'Doc',subject:'Doc',items:[]})};}");
+  await h.run(`builder('${type}')`);
+  assert.match(h.elements.get('#overlay').innerHTML,/name="property_id"/);
+  assert.match(h.elements.get('#overlay').innerHTML,/250 Second Ave/);
+  h.calls.length=0;
+  await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{client_id:'1',property_id:String(p2.id),title:'Doc',subject:'Doc'}}});
+  const createdBody=JSON.parse(h.calls.find(c=>c.options.method==='POST').options.body);
+  assert.equal(createdBody.property_id,p2.id);
+  await h.run(`builder('${type}',9)`);
+  h.calls.length=0;
+  await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{client_id:'1',property_id:'',title:'Doc',subject:'Doc'}}});
+  const clearedBody=JSON.parse(h.calls.find(c=>c.options.method==='PATCH').options.body);
+  assert.equal(clearedBody.property_id,null);
+ }
+ const homeHtml=await h.run("fetch=async path=>({ok:true,json:async()=>path==='/api/dashboard'?{summary:{requests:{statuses:{}},quotes:{statuses:{}},jobs:{statuses:{}},invoices:{statuses:{}}},appointment_metrics:{}}:[]});home()");
+ assert.match(homeHtml,/<h1>Good (?:morning|afternoon|evening), Jack<\/h1>/);
+ const recentIso=h.run('daysAgoIso(5)'),prevIso=h.run('daysAgoIso(45)'),oldIso=h.run('daysAgoIso(90)'),futureIso=h.run('daysAgoIso(-10)'),farFutureIso=h.run('daysAgoIso(-60)');
+ h.run(`cache.visits=[{id:1,status:'completed',completed_at:'${recentIso}',billable_amount_cents:5000},{id:2,status:'completed',completed_at:'${prevIso}',billable_amount_cents:5000},{id:3,status:'scheduled',scheduled_start:'${futureIso}T09:00:00Z',billable_amount_cents:7000},{id:4,status:'scheduled',scheduled_start:'${farFutureIso}T09:00:00Z',billable_amount_cents:9000}];`);
+ const quotesHtml=await h.run(`fetch=async path=>({ok:true,json:async()=>path==='/api/quotes'?[{id:1,status:'sent',issued_date:'${recentIso}',total_cents:10000,created_at:'${recentIso}'},{id:2,status:'approved',issued_date:'${recentIso}',approved_at:'${recentIso}',total_cents:20000,created_at:'${recentIso}'},{id:3,status:'sent',issued_date:'${prevIso}',total_cents:50000,created_at:'${prevIso}'},{id:4,status:'sent',issued_date:'${oldIso}',total_cents:90000,created_at:'${oldIso}'}]:[]});listPage('quotes')`);
+ assert.match(quotesHtml,/<h3>Sent<\/h3><small>Past 30 days · \+100%<\/small><div class="number"><strong>2<\/strong><\/div><small>\$300\.00<\/small>/);
+ assert.match(quotesHtml,/<h3>Converted<\/h3><small>Past 30 days · \+100%<\/small><div class="number"><strong>1<\/strong><\/div><small>\$200\.00<\/small>/);
+ const jobsHtml=await h.run(`fetch=async path=>({ok:true,json:async()=>path==='/api/jobs'?[{id:1,status:'active',end_date:'${futureIso}',created_at:'${recentIso}'}]:path==='/api/visits'?cache.visits:[]});listPage('jobs')`);
+ assert.match(jobsHtml,/<h3>Recent visits<\/h3><small>Past 30 days<\/small><div class="number"><strong>1<\/strong><\/div><small>\$50\.00<\/small>/);
+ assert.match(jobsHtml,/<h3>Visits scheduled<\/h3><small>Next 30 days<\/small><div class="number"><strong>1<\/strong><\/div><small>\$70\.00<\/small>/);
+ const mktHtml=await h.run(`marketingTab='Dashboard';fetch=async path=>({ok:true,json:async()=>path==='/api/automation-executions'?[{id:1,executed_at:'${recentIso}'},{id:2,executed_at:'${prevIso}'}]:[]});marketing()`);
+ assert.match(mktHtml,/1 automation executions/);
+ const camp=await request('marketing/campaigns','POST',{name:'Job Attribution Campaign',subject:'Promo',body:'Hi {{client_name}}',channel:'email'});
+ assert.equal(camp.status,201);assert.equal(camp.body.jobs_count,0);
+ const sentCamp=await request(`marketing/campaigns/${camp.body.id}/send`,'POST',{});
+ assert.equal(sentCamp.status,200);
+ w.createJob({client_id:2,title:'Post-campaign tile job',total_cents:25000});
+ const listed=(await request('marketing/campaigns')).body.find(c=>c.id===camp.body.id);
+ assert.ok(listed.jobs_count>=1);
+});
