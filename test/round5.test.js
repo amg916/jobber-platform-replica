@@ -1395,4 +1395,11 @@ test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, com
  await h.click({reportPill:"Late"});
  assert.match(h.elements.get("#report-table").innerHTML,/\$99\.00/);
  assert.doesNotMatch(h.elements.get("#report-table").innerHTML,/\$10\.00/);
+ const appsHtml=await h.run("appsTab=\"Featured\";apps()");
+ for(const text of ["Thumbtack","Byteline Sync","Custom Automations","Virtual Receptionists"])assert.match(appsHtml,new RegExp(text));
+ const repHtml=await h.run("reportPage(\"Projected income\")");
+ for(const text of ["Consent for email marketing","Kitchen backsplash complete\\?","Overall productivity","All columns","Selected columns"])assert.match(repHtml,new RegExp(text));
+ await h.run("builder(\"clients\")");assert.match(h.elements.get("#overlay").innerHTML,/No tax rate created/);
+ await h.run("builder(\"requests\")");assert.match(h.elements.get("#overlay").innerHTML,/Please provide as much information as you can/);
+ await h.run("builder(\"jobs\")");assert.match(h.elements.get("#overlay").innerHTML,/Remind me to invoice when I close the job/);
 });
