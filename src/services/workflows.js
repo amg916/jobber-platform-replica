@@ -17,7 +17,7 @@ export function workflows(db,org,actor=null) {
   return log(type,row,'created');
  }
  const api={r,
-  createClient:atomic(data=>{ const row=r.insert('clients',{...data,portal_token:token()}); log('clients',row,'created');emit(r,'client_created','clients',row.id);return row; }),
+  createClient:atomic(data=>{ if(!String(data.display_name||'').trim()){const n=[data.first_name,data.last_name].filter(Boolean).join(' ').trim()||String(data.company_name||'').trim(); if(n) data={...data,display_name:n};} const row=r.insert('clients',{...data,portal_token:token()}); log('clients',row,'created');emit(r,'client_created','clients',row.id);return row; }),
   createRequest:atomic(data=>{r.get('clients',data.client_id); const row=r.insert('requests',data); log('requests',row,'created');emit(r,'request_submitted','requests',row.id);return row;}),
   createQuote:atomic((data,items=[])=>document('quotes',data,items)),
   requestToQuote:atomic((id,data={},items=[])=>{const request=r.get('requests',id); if(request.status==='converted') fail('Request already converted',409); const quote=document('quotes',{...data,client_id:request.client_id,property_id:request.property_id,request_id:id,title:data.title||request.title},items);r.update('requests',id,{status:'converted'});return quote;}),

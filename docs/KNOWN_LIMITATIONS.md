@@ -22,4 +22,5 @@
 
 ## Verification and delivery
 
+- Full Level 1, Level 2, and Level 3 route, tab, and modal parity across Home, Schedule, Clients, Requests, Quotes, Jobs, Invoices, Marketing (Dashboard, Performance, Plan, Reviews, Email Campaigns, Website, More), Insights (with live `/api/reports/profitability` job costing), Reports (30 reports with interactive filter pills and cross-report links), Custom Reports, Expenses, Timesheets, Bookkeeping, Jobber Capital, Payments (Overview, Payouts, Disputes), Apps (21 Marketplace integrations), Receptionist (Dashboard, Manage), Refer and Earn, Community, and 19 Settings pages.
 - Syntax checks (`node --check`) and the full automated test suite (`npm test`) pass across backend, frontend, GraphQL, security, and customer parity suites.

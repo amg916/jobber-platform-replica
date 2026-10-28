@@ -1387,5 +1387,12 @@ test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, com
  assert.match(await h.run("settings('automations')"),/Auto-archive Quotes/);
  await h.run("builder('clients')");assert.match(h.elements.get('#overlay').innerHTML,/Lead source/);
  await h.run("builder('quotes')");assert.match(h.elements.get('#overlay').innerHTML,/Contract \/ Disclaimer/);
- await h.run("detail('clients',1)");assert.match(h.elements.get('#overlay').innerHTML,/Work overview[\s\S]*All your client files in one place/);
+ await h.run("detail('clients',1)");assert.match(h.elements.get('#overlay').innerHTML,/Work overview[\s\S]*Requests \(0\)[\s\S]*All your client files in one place/);
+ await h.run("detail('jobs',1)");assert.match(h.elements.get('#overlay').innerHTML,/<h3>Billing<\/h3>/);
+ const profHtml=await h.run("fetch=async p=>({ok:true,json:async()=>p==='/api/jobs'?[{id:7,client_id:1,job_number:7,total_cents:50000}]:p==='/api/reports/profitability'?[{id:7,labor_cost_cents:12000,expense_cost_cents:8000,profit_cents:30000,margin_percent:60}]:[]});insights()");
+ assert.match(profHtml,/\$120\.00[\s\S]*\$80\.00[\s\S]*\$300\.00[\s\S]*60%/);
+ h.elements.set("#report-table",{innerHTML:""});h.run("rows=[{id:1,status:\"past_due\",total_cents:9900},{id:2,status:\"paid\",total_cents:1000}];");
+ await h.click({reportPill:"Late"});
+ assert.match(h.elements.get("#report-table").innerHTML,/\$99\.00/);
+ assert.doesNotMatch(h.elements.get("#report-table").innerHTML,/\$10\.00/);
 });
