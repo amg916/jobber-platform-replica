@@ -64,7 +64,7 @@ export function sendMessage(repo,clientId,channel,body,subject='',related={}) {
 function execute(repo,run,rule) {
  const config=JSON.parse(rule.action_config_json||'{}'),entity=repo.get(run.entity_type,run.entity_id),clientId=run.entity_type==='clients'?entity.id:entity.client_id;
  switch(rule.action_type) {
-  case 'send_email': case 'send_sms': return sendMessage(repo,clientId,rule.action_type==='send_email'?'email':'sms',config.body||rule.name,config.subject||rule.name);
+  case 'send_email': case 'send_sms': { const client=repo.get('clients',clientId),name=client.display_name||[client.first_name,client.last_name].filter(Boolean).join(' ')||'Client',fill=s=>String(s??'').replace(/\{\{\s*client_name\s*\}\}/g,()=>name); return sendMessage(repo,clientId,rule.action_type==='send_email'?'email':'sms',fill(config.body||rule.name),fill(config.subject||rule.name)); }
   case 'create_task': case 'schedule_followup': return repo.insert('tasks',{client_id:clientId,job_id:run.entity_type==='jobs'?entity.id:null,title:config.title||rule.name,instructions:config.instructions||'',due_date:config.due_date||new Date().toISOString().slice(0,10),assigned_user_id:config.assigned_user_id||null});
   case 'notify_team_member': return repo.insert('notifications',{user_id:config.user_id||null,title:config.title||rule.name,body:config.body||'',entity_type:run.entity_type,entity_id:entity.id});
   case 'change_status': case 'update_record': {
@@ -83,8 +83,11 @@ export function runPending(db,now=new Date()) {
   const repo=repository(db,entry.organization_id);
   try { results.push(transaction(db,()=>{
    const run=repo.get('automation_executions',entry.id); if(run.status!=='queued') return run;
-   const rule=repo.get('automations',run.automation_id);
-   if(!rule.is_enabled) return repo.update('automation_executions',run.id,{status:'skipped',executed_at:now.toISOString()});
+   const rule=repo.get('automations',run.automation_id),entity=repo.list(run.entity_type,{id:run.entity_id})[0],conditions=JSON.parse(rule.conditions_json||'{}'),delayed=Number(rule.delay_minutes)>0;
+   const sentLogs=delayed&&run.trigger_event==='quote_sent'&&conditions.status==='awaiting_response'&&entity?repo.list('activity_logs',{entity_type:'quotes',entity_id:entity.id,action:'sent'}):[];
+   const canonicalBase=`${run.automation_id}:quote_sent:quotes:${entity?.id}`,canonicalKeys=new Set([canonicalBase,...sentLogs.map(l=>`${canonicalBase}:${l.id}`)]);
+   const staleTrigger=delayed&&sentLogs.length>1&&canonicalKeys.has(run.idempotency_key)&&run.idempotency_key!==`${canonicalBase}:${sentLogs.at(-1).id}`;
+   if(!rule.is_enabled||!entity||(delayed&&(staleTrigger||!matches(entity,conditions)))) return repo.update('automation_executions',run.id,{status:'skipped',executed_at:now.toISOString()});
    repo.update('automation_executions',run.id,{status:'running',attempt_count:run.attempt_count+1});
    const result=execute(repo,run,rule);
    repo.update('automations',rule.id,{run_count:rule.run_count+1,last_run_at:now.toISOString()});

@@ -1,6 +1,6 @@
 import { fail, transaction } from '../db/database.js';
 const escapePDF=value=>String(value??'').replace(/[^\x20-\x7e]/g,'?').replace(/[\\()]/g,'\\$&');
-export function generatePDF(document,items=[],organization={name:'Greenleaf Home & Lawn Services'}) {
+export function generatePDF(document,items=[],organization={name:'J S Custom Tile'}) {
  const money=c=>`$${((c||0)/100).toFixed(2)}`;
  const text=[organization.name,document.subject?'INVOICE':'QUOTE',document.title||document.subject||'',`Number: ${document.quote_number||document.invoice_number||document.id}`,`Status: ${document.status}`,`Issued: ${document.issued_date||''}`, '',...items.map(i=>`${i.name}   ${i.quantity} x ${money(i.unit_price_cents)}   ${money(i.total_cents)}`),'',`Subtotal: ${money(document.subtotal_cents)}`,`Discount: ${money(document.discount_cents)}`,`Tax: ${money(document.tax_cents)}`,`Total: ${money(document.total_cents)}`,`Balance: ${money(document.balance_due_cents??document.total_cents)}`,document.client_message||''];
  const pages=[];for(let i=0;i<text.length;i+=42)pages.push(text.slice(i,i+42));

@@ -8,7 +8,8 @@ import { createDatabase, repository } from '../src/db/database.js';
 import { seedDatabase } from '../src/db/seed.js';
 import { workflows } from '../src/services/workflows.js';
 import { startServer } from '../src/server.js';
-import { deliverWebhook, emit } from '../src/services/automations.js';
+import { deliverWebhook, emit, runPending } from '../src/services/automations.js';
+import { generatePDF } from '../src/services/pdf.js';
 
 const appSource=readFileSync(new URL('../src/public/app.js',import.meta.url),'utf8');
 function domHarness(){
@@ -21,6 +22,248 @@ function domHarness(){
 }
 function fixture(t){const db=createDatabase();seedDatabase(db);t.after(()=>db.close());return workflows(db,1,1);}
 async function httpFixture(t){const db=createDatabase();seedDatabase(db);const server=await startServer({db,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();return {db,session,reauth:async()=>{const fresh=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();session.token=fresh.token;},w:workflows(db,1,1),request:async(path,method='GET',data)=>{const res=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});return {status:res.status,body:await res.json()};}};}
+
+test('Customer parity: tile fixtures preserve entity counts, totals and reference accounts',t=>{
+ const {r}=fixture(t),catalog=r.list('products_services').sort((a,b)=>a.id-b.id);
+ assert.equal(catalog.length,20);assert.equal(catalog.filter(x=>x.item_type==='product').length,4);
+ assert.equal(catalog[0].name,'Custom Shower Tile Installation');assert.equal(catalog[19].item_type,'service');
+ catalog.forEach((x,i)=>assert.equal(x.category,i<15?'Tile & Remodel Services':'Tile Supplies'));
+ for(const [table,count] of [['clients',95],['requests',3],['quotes',3],['jobs',5],['invoices',4],['expenses',15],['subscription_payments',4],['appointments',0],['time_entries',0]])assert.equal(r.list(table).length,count);
+ for(const [table,key,total] of [['quotes','total_cents',14091500],['jobs','total_cents',23218500],['invoices','total_cents',14377750],['invoices','balance_due_cents',14265000]])assert.equal(r.list(table).reduce((sum,x)=>sum+x[key],0),total);
+ assert.equal(r.get('clients',6).billing_address,'1994 Howell Mill Rd, Atlanta, Georgia 30318');
+ for(const c of r.list('clients').filter(c=>c.id>6)){assert.match(c.phone,/^916/);assert.match(c.billing_address,/, CA (95670|95628|95762)$/);assert.match(c.notes,/Tile/);for(const p of r.list('properties',{client_id:c.id})){assert.equal(p.state,'CA');assert.equal(p.lat,38.62+(c.id-1)*.003);assert.equal(p.lng,-121.26+(c.id-1)*.003);}}
+ for(const x of r.list('templates')){assert.match(x.name,/^J S Custom Tile /);assert.equal(x.subject,'Your J S Custom Tile project update');assert.match(x.body,/J S Custom Tile/);}
+ assert.match(r.list('ai_receptionist_logs')[0].summary,/bathroom tile remodel/);
+ const campaigns=r.list('campaigns');assert.equal(campaigns.length,5);for(const c of campaigns){assert.equal(c.status,'draft');assert.equal(c.channel,'email');assert.deepEqual(JSON.parse(c.segment_filter_json),{status:'active'});}
+ assert.equal(r.list('notifications').filter(n=>!n.is_read).length,59);assert.equal(r.list('messages').filter(m=>m.direction==='inbound').length,3);
+ assert.match(generatePDF({id:1}).toString(),/J S Custom Tile/);
+});
+
+test('Customer parity: mark-read is scoped, idempotent and allowed with client read access',async t=>{
+ const {db,request}=await httpFixture(t);const other=repository(db,2).insert('notifications',{title:'Other organization',is_read:0});
+ assert.equal((await request('auth/workspace')).body.unread_notifications,59);
+ assert.equal((await request('auth/switch-user','POST',{user_id:4})).status,200);
+ assert.deepEqual((await request('notifications/mark-read','POST',{})).body,{marked_read:true,unread_notifications:0});
+ assert.equal((await request('auth/workspace')).body.unread_notifications,0);
+ assert.equal((await request('notifications/mark-read','POST',{})).status,200);
+ assert.equal(repository(db,2).get('notifications',other.id).is_read,0);
+ db.prepare("UPDATE permissions SET allowed=0 WHERE role_id=4 AND resource='clients' AND action='read'").run();
+ assert.equal((await request('notifications/mark-read','POST',{})).status,403);
+});
+
+test('Astra 6: notification drawer marks only fetched unread IDs and rejects invalid IDs',async t=>{
+ const {db,request}=await httpFixture(t),r=repository(db,1),h=domHarness();
+ const alreadyRead=r.insert('notifications',{title:'Already read',is_read:1}),other=repository(db,2).insert('notifications',{title:'Other organization',is_read:0});
+ let feed,arrived,marked;
+ h.context.fetch=async(path,options)=>{
+  if(path==='/api/notifications'){
+   const result=await request('notifications');feed=result.body;
+   arrived=r.insert('notifications',{title:'Arrived after GET',is_read:0});
+   return {ok:true,json:async()=>feed};
+  }
+  assert.equal(path,'/api/notifications/mark-read');assert.equal(options.method,'POST');
+  const data=JSON.parse(options.body);assert.deepEqual(data.ids,feed.filter(n=>!n.is_read).map(n=>n.id));assert.ok(!data.ids.includes(alreadyRead.id));
+  marked=request('notifications/mark-read','POST',data);const result=await marked;
+  return {ok:result.status===200,json:async()=>result.body};
+ };
+ await h.run("globalPanel('notifications')");assert.ok(marked);
+ assert.deepEqual((await marked).body,{marked_read:true,unread_notifications:1});
+ for(const n of feed)assert.equal(r.get('notifications',n.id).is_read,1);
+ assert.equal(r.get('notifications',arrived.id).is_read,0);
+ assert.equal((await request('notifications/mark-read','POST',{ids:[other.id]})).body.unread_notifications,1);
+ assert.equal(repository(db,2).get('notifications',other.id).is_read,0);
+ assert.equal((await request('notifications/mark-read','POST',{ids:[]})).body.unread_notifications,1);
+ for(const ids of [null,{},'1',[0],[-1],[1.5],[Number.MAX_SAFE_INTEGER+1],['1'],[true],[null],[arrived.id,'invalid']]){
+  const result=await request('notifications/mark-read','POST',{ids});assert.equal(result.status,400);assert.match(JSON.stringify(result.body),/Invalid notification IDs/);
+ }
+ assert.equal(r.get('notifications',arrived.id).is_read,0);
+});
+
+test('Customer parity: notification drawer renders before mark-read completes',async()=>{
+ const h=domHarness();let removed=false;h.elements.set('#notification-badge',{remove(){removed=true;}});
+ h.context.fetch=async path=>{h.calls.push(path);if(path.endsWith('mark-read'))return new Promise(()=>{});return {ok:true,json:async()=>Array.from({length:59},(_,i)=>({id:i,title:'Reminder to clock out',body:'Reminder',is_read:0,created_at:'2026-10-17'}))};};
+ await h.run("globalPanel('notifications')");assert.equal(removed,true);assert.equal(h.run('unreadNotifications'),0);assert.match(h.elements.get('#overlay').innerHTML,/Activity <span class="tab-count">59/);assert.ok(h.calls.includes('/api/notifications/mark-read'));
+});
+
+test('Astra 6 P2: mark-read reconciles new unread notifications and restores failed reads',async()=>{
+ for(const fails of [false,true])for(const nativeInsert of [false,true]){
+  const h=domHarness(),markup='<span id="notification-badge" class="badge"></span>',header={innerHTML:`<button data-global="notifications">${markup}</button>`};
+  h.elements.set('#header',header);
+  const addBadge=()=>h.elements.set('#notification-badge',{remove(){h.elements.delete('#notification-badge');header.innerHTML=header.innerHTML.replace(markup,'');}});addBadge();
+  if(nativeInsert)h.elements.set('[data-global="notifications"]',{insertAdjacentHTML(position,html){assert.equal(position,'beforeend');header.innerHTML=header.innerHTML.replace('</button>',html+'</button>');addBadge();}});
+  let resolve,reject;const pending=new Promise((yes,no)=>{resolve=yes;reject=no;});
+  h.context.fetch=async path=>path.endsWith('mark-read')?pending:{ok:true,json:async()=>[{id:1,title:'Unread',is_read:0,created_at:'2026-10-17'},{id:2,title:'Unread too',is_read:0,created_at:'2026-10-17'},{id:3,title:'Read',is_read:1,created_at:'2026-10-17'}]};
+  await h.run("globalPanel('notifications')");assert.equal(h.run('unreadNotifications'),0);assert.doesNotMatch(header.innerHTML,/notification-badge/);
+  h.run("modal('New editor','Unsaved content')");const overlay=h.elements.get('#overlay').innerHTML;
+  if(fails)reject(Error('Offline'));else resolve({ok:true,json:async()=>({unread_notifications:1})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.run('unreadNotifications'),fails?2:1);assert.equal((header.innerHTML.match(/id="notification-badge"/g)||[]).length,1);
+  h.run('setNotificationBadge(unreadNotifications)');assert.equal((header.innerHTML.match(/id="notification-badge"/g)||[]).length,1);assert.equal(h.elements.get('#overlay').innerHTML,overlay);
+ }
+});
+
+test('Astra 6 P2: stale mark-read success or failure cannot restore a newer cleared badge',async()=>{
+ for(const fails of [false,true])for(const newerUnread of [false,true]){
+  const h=domHarness(),pending=[];let opens=0;
+  h.elements.set('#notification-badge',{remove(){h.elements.delete('#notification-badge');}});
+  h.elements.set('[data-global="notifications"]',{insertAdjacentHTML(){h.elements.set('#notification-badge',{});}});
+  h.context.fetch=async(path,options)=>{
+   if(path==='/api/notifications'){const is_read=opens++===0||newerUnread?0:1;return {ok:true,json:async()=>[{id:1,title:'Notification',is_read,created_at:'2026-10-17'}]};}
+   assert.equal(path,'/api/notifications/mark-read');assert.equal(options.method,'POST');
+   return new Promise((resolve,reject)=>pending.push({resolve,reject}));
+  };
+  await h.run("globalPanel('notifications')");await h.run("globalPanel('notifications')");
+  assert.equal(pending.length,newerUnread?2:1);
+  if(newerUnread){pending[1].resolve({ok:true,json:async()=>({unread_notifications:0})});await new Promise(resolve=>setImmediate(resolve));}
+  assert.equal(h.run('unreadNotifications'),0);assert.equal(h.elements.has('#notification-badge'),false);
+  if(fails)pending[0].reject(Error('Offline'));else pending[0].resolve({ok:true,json:async()=>({unread_notifications:1})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.run('unreadNotifications'),0);assert.equal(h.elements.has('#notification-badge'),false);
+ }
+});
+
+test('Astra 6 P2: campaign migration backfills historical timestamps idempotently',t=>{
+ const db=createDatabase();t.after(()=>db.close());
+ db.exec('ALTER TABLE campaigns DROP COLUMN updated_at');
+ db.exec("INSERT INTO organizations (id,name,slug) VALUES (1,'Test','test'); INSERT INTO campaigns (organization_id,name,created_at,sent_at) VALUES (1,'Draft','2020-01-01',NULL),(1,'Sent','2020-01-01','2020-02-01')");
+ migrate(db);assert.deepEqual(db.prepare('SELECT updated_at FROM campaigns ORDER BY id').all().map(c=>c.updated_at),['2020-01-01','2020-02-01']);
+ db.exec("UPDATE campaigns SET updated_at='2020-03-01' WHERE id=1");migrate(db);assert.equal(db.prepare('SELECT updated_at FROM campaigns WHERE id=1').get().updated_at,'2020-03-01');
+});
+
+test('Astra 6 P2: campaign edits and sends refresh displayed and sorted Last Updated',async t=>{
+ const {db,request}=await httpFixture(t),r=repository(db,1),h=domHarness();
+ for(const action of ['edit','send']){
+  const old=r.insert('campaigns',{name:'Older '+action,created_at:'2020-01-01',updated_at:'2020-01-01',subject:'Offer',body:'Hello'}),newer=r.insert('campaigns',{name:'Newer '+action,created_at:'2021-01-01',updated_at:'2021-01-01'});
+  h.context.campaigns=[old,newer];assert.equal(h.run("campaignSort={key:'created_at',direction:-1};sortCampaignList(campaigns)[0].id"),newer.id);
+  const before=Date.now(),result=await request('marketing/campaigns/'+old.id+(action==='send'?'/send':''),action==='send'?'POST':'PATCH',action==='send'?{}:{name:'Edited campaign'});assert.equal(result.status,200);
+  const updated=r.get('campaigns',old.id);assert.ok(Date.parse(updated.updated_at)>=before);assert.equal(updated.created_at,old.created_at);
+  h.context.campaigns=[updated,newer];assert.equal(h.run('sortCampaignList(campaigns)[0].id'),old.id);assert.equal(h.run('campaignColumns[7][1](campaigns[0])'),h.run('esc(monthDay(campaigns[0].updated_at))'));
+ }
+ h.context.campaigns=[{id:1,created_at:'2020-01-01',sent_at:'2022-01-01'},{id:2,created_at:'2021-01-01'}];assert.equal(h.run('sortCampaignList(campaigns)[0].id'),1);assert.equal(h.run('campaignColumns[7][1](campaigns[0])'),h.run('esc(monthDay(campaigns[0].sent_at))'));
+});
+
+test('Astra 6 P2: campaign job display and sorting never use revenue cents',()=>{
+ const h=domHarness();h.context.campaigns=[{id:1,jobs_count:'2',revenue_attributed_cents:0},{id:2,revenue_attributed_cents:90000},{id:3,jobs_count:null,revenue_attributed_cents:80000},{id:4,jobs_count:'invalid',revenue_attributed_cents:70000},{id:5,jobs_count:0,revenue_attributed_cents:60000}];
+ assert.equal(h.run('campaigns.map(c=>campaignColumns[3][1](c)).join()'),'2,0,0,0,0');
+ assert.equal(h.run("campaignSort={key:'jobs_count',direction:1};sortCampaignList(campaigns).map(c=>c.id).join()"),'2,3,4,5,1');
+ assert.equal(h.run("campaignSort.direction=-1;sortCampaignList(campaigns).map(c=>c.id).join()"),'1,2,3,4,5');
+});
+
+test('Customer parity: expense report category and all client hub sections render',async()=>{
+ const h=domHarness();h.run("clients=[{id:1}]");const reports=h.run('reports()');assert.equal((reports.match(/<section class="card">/g)||[]).length,6);assert.match(reports,/Expense reports/);assert.equal(h.run("reportTypes.Mileage"),'expenses');
+ const hub=await h.run("settings('client-hub')");for(const key of ['Menu visibility','Signatures','Change requests','Appointment times','Request forms','Primary button','Referrals'])assert.ok(hub.includes(`data-preference="hub-${key}"`));assert.equal((hub.match(/class="hub-section"/g)||[]).length,7);
+});
+
+test('Customer parity: campaign layout, filters, sorting, generation and automation setup',async t=>{
+ const h=domHarness();h.run("org={name:'J S Custom Tile'};marketingTab='Email Campaigns'");
+ h.context.fetch=async()=>({ok:true,json:async()=>[{id:1,name:'Shower',subject:'Tile',status:'draft',created_at:'2026-10-01',opened_count:10},{id:2,name:'Bath',subject:'Tile',status:'sent',created_at:'2026-10-02',opened_count:2}]});
+ const html=await h.run('marketing()');for(const text of ['AI Campaign Generator','Set up automated Campaigns','Re-engage past clients','Win back lost leads','Quote follow-ups','All Campaigns','Jack Surwald','One-off'])assert.ok(html.includes(text));assert.match(html,/send-campaign:1/);assert.doesNotMatch(html,/send-campaign:2/);
+ for(const id of ['search','creator-filter','status-filter','type-filter','table','count'])h.elements.set('#campaign-'+id,{value:'',innerHTML:'',textContent:''});
+ const headers=Array.from({length:8},()=>({setAttribute(){}}));h.context.document.querySelectorAll=s=>s==='#campaign-table th'?headers:[];h.run('bindCampaigns()');headers[1].onclick();assert.ok(h.elements.get('#campaign-table').innerHTML.indexOf('Bath')<h.elements.get('#campaign-table').innerHTML.indexOf('Shower'));
+ h.elements.get('#campaign-status-filter').value='draft';h.elements.get('#campaign-status-filter').onchange();assert.equal(h.elements.get('#campaign-count').textContent,'(1 results)');
+ h.elements.get('#campaign-search').value='missing';h.elements.get('#campaign-search').oninput();assert.equal(h.elements.get('#campaign-count').textContent,'(0 results)');
+ h.elements.set('#campaign-prompt',{value:'Custom tile offer'});h.run('render=async()=>{}');h.context.fetch=async(path,options)=>{h.calls.push({path,options});return {ok:true,json:async()=>({id:3})};};await h.click({action:'generate-email'});const call=h.calls.find(c=>c.path==='/api/marketing/campaigns');assert.equal(JSON.parse(call.options.body).status,'draft');
+ for(const option of ['reengage','lost-leads','quote-followups']){await h.click({action:'setup-auto-campaign:'+option});await h.elements.get('#action-form').onsubmit({preventDefault(){},target:{values:{name:option,subject:'Tile',body:'J S Custom Tile',delay_minutes:'10'}}});}
+ const w=fixture(t),r=w.r,generated=JSON.parse(call.options.body);assert.ok(generated.body.includes('Hi {{client_name}},'));
+ const dollarClient=r.update('clients',1,{display_name:'Tile $& Stone',status:'active',receives_marketing:1,receives_email:1});
+ const campaign=r.insert('campaigns',generated),before=new Set(r.list('messages').map(m=>m.id)),sent=w.sendCampaign(campaign.id),messages=r.list('messages').filter(m=>!before.has(m.id));
+ assert.ok(messages.length>1);assert.equal(messages.length,sent.recipients_count);
+ for(const message of messages){const client=r.get('clients',message.client_id);assert.ok(message.body.includes(`Hi ${client.display_name},`));assert.ok(!message.body.includes('{{client_name}}'));assert.ok(!message.subject.includes('{{client_name}}'));}
+ assert.ok(messages.find(m=>m.client_id===dollarClient.id).body.includes('Hi Tile $& Stone,'));
+ const rule=r.insert('automations',{name:'Literal client name',trigger_event:'client_created',delay_minutes:0,conditions_json:{},action_type:'send_email',action_config_json:{subject:'Hi {{client_name}},',body:'Hi {{client_name}},'},is_enabled:1});
+ const run=emit(r,'client_created','clients',dollarClient.id).find(run=>run.automation_id===rule.id);
+ runPending(r.db,new Date(run.scheduled_for));assert.equal(r.get('automation_executions',run.id).status,'succeeded');
+ const message=r.list('messages',{client_id:dollarClient.id,subject:'Hi Tile $& Stone,'})[0];assert.ok(message);assert.equal(message.body,'Hi Tile $& Stone,');assert.equal(message.subject,'Hi Tile $& Stone,');
+ const automations=h.calls.filter(c=>c.path==='/api/automations').map(c=>JSON.parse(c.options.body));assert.equal(automations.length,3);
+ assert.deepEqual(automations.map(a=>a.conditions_json),[{status:{in:['requires_invoicing','completed']}},{status:'lead'},{status:'awaiting_response'}]);
+});
+
+test('Astra 6 P2: delayed quote follow-ups skip approved and superseded sends',t=>{
+ const w=fixture(t),r=w.r,rule=r.insert('automations',{name:'Quote follow-ups',trigger_event:'quote_sent',delay_minutes:4320,conditions_json:{status:'awaiting_response'},action_type:'send_email',action_config_json:{subject:'Delayed quote follow-up',body:'Still interested?'},is_enabled:1});
+ const quote=()=>w.createQuote({client_id:1,title:'Delayed follow-up'},[{name:'Tile',quantity:1,unit_price_cents:1000}]);
+ const approved=quote(),resent=quote(),waiting=quote();
+ const taskRule=r.insert('automations',{name:'Record sent quote',trigger_event:'quote_sent',conditions_json:{},delay_minutes:0,action_type:'create_task',action_config_json:{title:'Record sent quote'},is_enabled:1});
+ for(const q of [approved,resent,waiting])w.sendQuote(q.id);
+ const initial=r.list('automation_executions',{automation_id:rule.id});assert.equal(initial.length,3);
+ w.approveQuote(approved.id,'Client');w.requestChanges(resent.id,'Please revise');w.sendQuote(resent.id);
+ const runs=r.list('automation_executions',{automation_id:rule.id});assert.equal(runs.length,4);
+ const due=new Date(Math.max(...runs.map(run=>Date.parse(run.scheduled_for))));
+ runPending(r.db,new Date(Math.min(...runs.map(run=>Date.parse(run.scheduled_for)))-1));
+ assert.ok(r.list('automation_executions',{automation_id:rule.id}).every(run=>run.status==='queued'));
+ assert.equal(r.list('messages',{subject:'Delayed quote follow-up'}).length,0);
+ runPending(r.db,due);
+ assert.equal(r.list('automation_executions',{automation_id:taskRule.id,entity_id:approved.id})[0].status,'succeeded');
+ assert.equal(r.list('automation_executions',{automation_id:rule.id,entity_id:approved.id})[0].status,'skipped');
+ for(const run of initial){const saved=r.get('automation_executions',run.id);assert.equal(saved.status,run.entity_id===waiting.id?'succeeded':'skipped');assert.equal(saved.executed_at,due.toISOString());if(saved.status==='skipped')assert.equal(saved.attempt_count,0);}
+ assert.equal(r.get('automation_executions',runs.at(-1).id).status,'succeeded');
+ assert.equal(r.list('messages',{subject:'Delayed quote follow-up'}).length,2);
+ runPending(r.db,due);assert.equal(r.list('messages',{subject:'Delayed quote follow-up'}).length,2);
+ const custom=emit(r,'quote_sent','quotes',resent.id,'external-event-123')[0];
+ runPending(r.db,new Date(Date.parse(custom.scheduled_for)+1));
+ assert.equal(r.get('automation_executions',custom.id).status,'succeeded');
+});
+
+test('Astra 6 P2: delayed lost-lead campaigns recheck client conditions',t=>{
+ const w=fixture(t),r=w.r,rule=r.insert('automations',{name:'Win back lost leads',trigger_event:'client_created',delay_minutes:10080,conditions_json:{status:'lead'},action_type:'send_email',action_config_json:{subject:'Delayed lost-lead follow-up',body:'Ready to start?'},is_enabled:1});
+ const converted=w.createClient({display_name:'Converted lead',status:'lead',email:'converted@example.test',receives_email:1}),lead=w.createClient({display_name:'Still a lead',status:'lead',email:'lead@example.test',receives_email:1});
+ r.update('clients',converted.id,{status:'active'});
+ const runs=r.list('automation_executions',{automation_id:rule.id});assert.equal(runs.length,2);
+ runPending(r.db,new Date(Math.max(...runs.map(run=>Date.parse(run.scheduled_for)))));
+ for(const run of runs)assert.equal(r.get('automation_executions',run.id).status,run.entity_id===converted.id?'skipped':'succeeded');
+ const messages=r.list('messages',{subject:'Delayed lost-lead follow-up'});assert.equal(messages.length,1);assert.equal(messages[0].client_id,lead.id);
+ for(const reverse of [false,true]){
+  const w=fixture(t),r=w.r,actions=[{action_type:'change_status',action_config_json:{status:'active'}},{action_type:'create_task',action_config_json:{title:'Lead onboarding'}}];
+  if(reverse)actions.reverse();
+  const rules=actions.map(action=>r.insert('automations',{name:action.action_type,trigger_event:'client_created',delay_minutes:0,conditions_json:{status:'lead'},is_enabled:1,...action}));
+  const client=w.createClient({display_name:'Immediate onboarding',status:'lead'}),runs=r.list('automation_executions',{entity_type:'clients',entity_id:client.id}).filter(run=>rules.some(rule=>rule.id===run.automation_id));
+  assert.equal(runs.length,2);assert.ok(runs.every(run=>run.status==='queued'));
+  runPending(r.db,new Date(Math.max(...runs.map(run=>Date.parse(run.scheduled_for)))));
+  for(const run of runs)assert.equal(r.get('automation_executions',run.id).status,'succeeded');
+  assert.equal(r.get('clients',client.id).status,'active');assert.equal(r.list('tasks',{client_id:client.id,title:'Lead onboarding'}).length,1);
+ }
+});
+
+test('Astra 6: marketing re-renders preserve campaign order matching aria-sort',async()=>{
+ const h=domHarness();h.run("marketingTab='Email Campaigns'");
+ const campaigns=[{id:1,name:'Zulu',status:'draft',opened_count:9,jobs_count:5,revenue_attributed_cents:5,created_at:'2026-10-01',updated_at:'2026-10-03'},{id:2,name:'Alpha',status:'draft',opened_count:2,jobs_count:0,revenue_attributed_cents:99,created_at:'2026-10-02'}];
+ h.context.fetch=async()=>({ok:true,json:async()=>campaigns});
+ for(const id of ['search','creator-filter','status-filter','type-filter','table','count'])h.elements.set('#campaign-'+id,{value:'',innerHTML:'',textContent:''});
+ const headers=Array.from({length:8},()=>({setAttribute(key,value){this[key]=value;}}));h.context.document.querySelectorAll=s=>s==='#campaign-table th'?headers:[];
+ await h.run('marketing()');h.run('bindCampaigns()');
+ for(const column of [0,1,3,7])for(const direction of ['ascending','descending']){
+  headers[column].onclick();assert.equal(headers[column]['aria-sort'],direction);
+  const expected=h.elements.get('#campaign-table').innerHTML;
+  assert.ok(expected.indexOf(direction==='ascending'?'Alpha':'Zulu')<expected.indexOf(direction==='ascending'?'Zulu':'Alpha'));
+  await h.run("marketingTab='Dashboard';marketing()");h.run("marketingTab='Email Campaigns'");
+  const html=await h.run('marketing()');h.run('bindCampaigns()');
+  assert.ok(html.includes(`<div id="campaign-table">${expected}</div>`));assert.equal(headers[column]['aria-sort'],direction);
+  assert.deepEqual(campaigns.map(c=>c.name),['Zulu','Alpha']);
+ }
+});
+
+test('Customer parity: stale marketing responses cannot overwrite campaigns after navigation',async()=>{
+ const h=domHarness(),pending=[];h.elements.set('#breadcrumb',{textContent:''});
+ h.context.fetch=()=>new Promise(resolve=>pending.push(data=>resolve({ok:true,json:async()=>data})));
+ h.run("route='campaigns'");const stale=h.run('render()');
+ await h.run("route='reports';render()");
+ const reportHTML=h.elements.get('#workspace').innerHTML;
+ pending.shift()([{id:1,name:'Stale',status:'draft'}]);await stale;
+ assert.equal(h.run('campaignRows.length'),0);assert.equal(h.elements.get('#workspace').innerHTML,reportHTML);
+ h.run("route='campaigns'");const older=h.run('render()'),newer=h.run('render()');
+ pending[1]([{id:3,name:'Newest',status:'draft',created_at:'2026-10-28'}]);await newer;
+ const campaignHTML=h.elements.get('#workspace').innerHTML;
+ pending[0]([{id:2,name:'Older',status:'draft',created_at:'2026-10-27'}]);await older;
+ assert.equal(h.run('campaignRows[0].id'),3);assert.equal(h.elements.get('#workspace').innerHTML,campaignHTML);
+});
+
+test('Customer parity: all list resources sort numerically and retain active search/status filters',()=>{
+ for(const [type,label,key,low,high] of [['clients','Name ↕','display_name','Alpha','Zulu'],['requests','Requested','created_at','2026-01-01','2026-10-01'],['quotes','Total','total_cents',2,10],['jobs','Job number','job_number',2,10],['invoices','Balance','balance_due_cents',2,10],['expenses','Amount','amount_cents',2,10],['payments','Amount','amount_cents',2,10]]){
+  const h=domHarness(),th={textContent:label,setAttribute(){}};h.context.document.querySelectorAll=s=>s==='#data-table th'?[th]:[];
+  for(const [id,value] of [['table-search','keep'],['status-filter','active']])h.elements.set('#'+id,{value});for(const id of ['data-table','result-count'])h.elements.set('#'+id,{innerHTML:'',textContent:''});
+  h.context.inputRows=[{id:1,status:'active',title:'keep',display_name:'keep',created_at:'2026-10-01',updated_at:'2026-10-01',date_incurred:'2026-10-01',[key]:high},{id:2,status:'active',title:'keep',display_name:'keep',created_at:'2026-10-01',updated_at:'2026-10-01',date_incurred:'2026-10-01',[key]:low},{id:3,status:'draft',title:'keep',[key]:low},{id:4,status:'active',title:'excluded',[key]:high}];
+  h.run(`resource='${type}';rows=inputRows;bindView()`);th.onclick();let html=h.elements.get('#data-table').innerHTML;assert.ok(html.indexOf('data-id="2"')<html.indexOf('data-id="1"'));assert.doesNotMatch(html,/data-id="[34]"/);assert.equal(h.elements.get('#result-count').textContent,'(2 results)');th.onclick();html=h.elements.get('#data-table').innerHTML;assert.ok(html.indexOf('data-id="1"')<html.indexOf('data-id="2"'));assert.equal(h.elements.get('#table-search').value,'keep');
+ }
+});
 
 test('Astra 6 P2: OAuth refresh transfers revision ownership and logout clears it',async t=>{
  const {w,request,session}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'OAuth revision',field_key:'oauth_revision',field_type:'text'});

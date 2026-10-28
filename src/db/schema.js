@@ -35,7 +35,7 @@ export const definitions = {
  time_entries: 'organization_id! user_id! job_id visit_id category=general|job|travel|break start_at! end_at duration_minutes# hourly_cost_cents$ total_cost_cents$ notes billable? created_at',
  expenses: 'organization_id! job_id user_id item_name! accounting_code description date_incurred amount_cents$ reimbursable? billable? invoiced? receipt_url created_at',
  templates: 'organization_id! template_type=email|sms|quote|invoice|job_checklist name! subject body variables_json is_default? created_at',
- campaigns: 'organization_id! name! channel=email|sms segment_filter_json template_id subject body status=draft|scheduled|sent recipients_count$ delivered_count$ opened_count$ clicked_count$ revenue_attributed_cents$ sent_at created_at',
+ campaigns: 'organization_id! name! channel=email|sms segment_filter_json template_id subject body status=draft|scheduled|sent recipients_count$ delivered_count$ opened_count$ clicked_count$ revenue_attributed_cents$ sent_at created_at updated_at',
  messages: 'organization_id! client_id channel=email|sms|portal|in_app direction=outbound|inbound recipient subject body related_entity_type related_entity_id status=delivered|test_mode|queued|failed provider_mode=sandbox|configured created_at',
  notifications: 'organization_id! user_id title! body entity_type entity_id is_read? created_at',
  automations: 'organization_id! name! description trigger_event=client_created|request_submitted|quote_sent|quote_approved|job_scheduled|visit_approaching|job_completed|invoice_issued|invoice_overdue|payment_received conditions_json delay_minutes$ action_type=send_email|send_sms|create_task|change_status|notify_team_member|schedule_followup|update_record action_config_json is_enabled? run_count$ last_run_at created_at',
@@ -75,6 +75,8 @@ export function migrate(db) {
  if(!db.prepare('PRAGMA table_info(webhook_subscriptions)').all().some(c=>c.name==='delivered_keys_json'))db.exec("ALTER TABLE webhook_subscriptions ADD COLUMN delivered_keys_json TEXT DEFAULT '[]'");
  if(!db.prepare('PRAGMA table_info(visits)').all().some(c=>c.name==='occurrence_start'))db.exec('ALTER TABLE visits ADD COLUMN occurrence_start TEXT');
  db.exec('UPDATE visits SET occurrence_start=scheduled_start WHERE occurrence_start IS NULL AND scheduled_start IS NOT NULL');
+ if(!db.prepare('PRAGMA table_info(campaigns)').all().some(c=>c.name==='updated_at'))db.exec('ALTER TABLE campaigns ADD COLUMN updated_at TEXT');
+ db.exec('UPDATE campaigns SET updated_at=COALESCE(sent_at,created_at) WHERE updated_at IS NULL');
  if(!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='website'))db.exec('ALTER TABLE organizations ADD COLUMN website TEXT');
  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS org_slug ON organizations(slug);
  CREATE UNIQUE INDEX IF NOT EXISTS session_token ON sessions(token);

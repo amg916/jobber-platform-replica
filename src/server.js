@@ -65,7 +65,7 @@ export function createApp({db,allowDemoSwitch=false,oauthClients={}}){
   if(parts[1]==='work_objects'&&method==='GET'){const result={},search=(url.searchParams.get('q')||'').toLowerCase();for(const table of ['requests','quotes','jobs','invoices']){authorize(db,user,table,false);result[table]=r.list(table).filter(x=>!search||[x.title,x.subject,String(x.id)].some(v=>v?.toLowerCase().includes(search)));}return json(res,200,result);}
   if(parts[1]==='invoices'&&parts[3]==='record-payment'&&method==='POST'){authorize(db,user,'invoices',true);authorize(db,user,'payments',true);const invoice=r.get('invoices',Number(parts[2]));return json(res,201,w.recordPayment({...data,invoice_id:invoice.id,client_id:invoice.client_id}));}
   if(parts[1]==='auth'){
-   if(parts[2]==='workspace'&&method==='GET')return json(res,200,{organization:db.prepare('SELECT id,name,timezone FROM organizations WHERE id=?').get(org),team:r.list('users').map(u=>({id:u.id,name:u.name}))});
+   if(parts[2]==='workspace'&&method==='GET')return json(res,200,{organization:db.prepare('SELECT id,name,timezone FROM organizations WHERE id=?').get(org),team:r.list('users').map(u=>({id:u.id,name:u.name})),unread_notifications:r.list('notifications').filter(n=>!n.is_read).length});
    if(parts[2]==='me'&&method==='GET')return json(res,200,{user:safeUser(user),permissions:db.prepare('SELECT resource,action,allowed FROM permissions WHERE role_id=?').all(user.role_id)});
    if(parts[2]==='logout'&&method==='POST'){db.prepare('UPDATE sessions SET expires_at=? WHERE id=?').run(new Date(0).toISOString(),session.id);authService.revoke(session.token);pruneRevSessions(session.id);sessionCookie(res,'',true);return json(res,200,{logged_out:true});}
    if(['switch-user','switch-org'].includes(parts[2])&&method==='POST'){if(!allowDemoSwitch)fail('Demo switching disabled',403);authorize(db,user,'settings',true);const target=parts[2]==='switch-user'?r.get('users',Number(data.user_id)):db.prepare("SELECT u.* FROM users u JOIN roles r ON r.id=u.role_id WHERE u.organization_id=? AND r.slug='owner' AND u.is_active=1").get(Number(data.organization_id));if(!target||!target.is_active)fail('User not found',404);db.prepare('UPDATE sessions SET user_id=?,organization_id=? WHERE id=?').run(target.id,target.organization_id,session.id);return json(res,200,safeUser(target));}fail('Auth route not found',404);
@@ -84,6 +84,14 @@ export function createApp({db,allowDemoSwitch=false,oauthClients={}}){
     r.update('clients',source.id,{status:'archived',balance_cents:0,notes:`Merged into client #${target.id}. ${source.notes||''}`});
     return safeClient(r.get('clients',target.id));
    });return json(res,200,result);
+  }
+  if(parts[1]==='notifications'&&parts[2]==='mark-read'&&method==='POST'){
+   authorize(db,user,'clients',false);
+   if(data.ids!==undefined){
+    if(!Array.isArray(data.ids)||!data.ids.every(x=>typeof x==='number'&&Number.isSafeInteger(x)&&x>0))fail('Invalid notification IDs',400);
+    if(data.ids.length)db.prepare(`UPDATE notifications SET is_read=1 WHERE organization_id=? AND is_read=0 AND id IN (${data.ids.map(()=>'?').join(',')})`).run(org,...data.ids);
+   }else db.prepare('UPDATE notifications SET is_read=1 WHERE organization_id=? AND is_read=0').run(org);
+   return json(res,200,{marked_read:true,unread_notifications:r.list('notifications').filter(n=>!n.is_read).length});
   }
   if(parts[1]==='permissions'){authorize(db,user,'team',write);const role=r.get('roles',Number(url.searchParams.get('role_id')||data.role_id||user.role_id));if(write){if(!['read','write'].includes(data.action)||typeof data.resource!=='string')fail('Invalid permission');db.prepare('INSERT INTO permissions(role_id,resource,action,allowed) VALUES(?,?,?,?) ON CONFLICT(role_id,resource,action) DO UPDATE SET allowed=excluded.allowed').run(role.id,data.resource,data.action,Number(!!data.allowed));}return json(res,200,db.prepare('SELECT * FROM permissions WHERE role_id=?').all(role.id));}
   if(parts[1]==='dashboard'){
