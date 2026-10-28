@@ -1354,3 +1354,27 @@ test('tightening loop: address_line2 persistence, builder property_id, 30-day/7-
  const listed=(await request('marketing/campaigns')).body.find(c=>c.id===camp.body.id);
  assert.ok(listed.jobs_count>=1);
 });
+test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, community, jobber-capital, bookkeeping, receptionist, and settings views',async()=>{
+ const h=domHarness();
+ h.run("user={id:1,name:'Jack Surwald'};org={name:'J S Custom Tile',phone:'9167518715',website:'jscustomtile.com'};clients=[{id:1,display_name:'Client 1',status:'lead'}];");
+ const insightsHtml=await h.run("fetch=async path=>({ok:true,json:async()=>path==='/api/dashboard'?{receivables_cents:10000}:[]});insights()");
+ for(const text of ['Insights','Overview','New leads','New requests','Converted quotes','New one-off jobs','Invoiced value','Revenue','Profit and loss','Cashflow','Lead conversion','Receivables'])assert.match(insightsHtml,new RegExp(text));
+ const customHtml=h.run('customReports()');
+ for(const text of ['Custom Reports','Revenue by Visit Type','Profit and Loss Trend','Recurring Income by Lead','Your data, the way you need to see it','Create your first Report'])assert.match(customHtml,new RegExp(text));
+ const referHtml=await h.run('referAndEarn()');
+ for(const text of ['Refer and get rewarded','Milestone Rewards','\\$100 prepaid card','Jobber mystery box','\\$1,000 vacation voucher','Your stats','You have not sent any referrals yet\\.'])assert.match(referHtml,new RegExp(text));
+ const commHtml=h.run('communityPage()');
+ for(const text of ['Jobber Now','Find answers in The Home Service Community Forum','Support your business with Jobber Grants','Listen to the Masters of Home Service podcast'])assert.match(commHtml,new RegExp(text));
+ const capHtml=h.run('jobberCapital()');
+ for(const text of ['Jobber Capital','Financing tailored to your business','One fixed fee','No personal guarantees required','Build your eligibility for Jobber Capital'])assert.match(capHtml,new RegExp(text));
+ const bkHtml=await h.run("fetch=async()=>({ok:true,json:async()=>({income_cents:0,expense_cents:0,tax_cents:0,ledger:[]})});bookkeeping()");
+ for(const text of ['Numbers you can actually use','Dedicated bookkeeping','Automatic syncing with no double entry','Reconciliation'])assert.match(bkHtml,new RegExp(text));
+ const recHtml=await h.run("fetch=async()=>({ok:true,json:async()=>[]});receptionist()");
+ for(const text of ['Test Receptionist','A dedicated phone number is required','Time Saved','Workflows Created','Call history & Conversations'])assert.match(recHtml,new RegExp(text));
+ const mktQuiet=await h.run("marketingTab='Dashboard';fetch=async()=>({ok:true,json:async()=>[]});marketing()");
+ for(const text of ['GOOGLE BUSINESS PROFILE','REFERRALS','CREATE WEBSITE','All quiet this week — your automations are standing by\\.'])assert.match(mktQuiet,new RegExp(text));
+ for(const [page,expected] of [['business-profile','Essential information'],['work-settings','Payment terms'],['schedule','Appointment layout'],['location-services','Location timers'],['dedicated-phone-number','Dedicated Phone Number'],['expense-tracking','Accounting codes'],['account-connections','Google Business Profile']]){
+  const sHtml=await h.run(`settings('${page}')`);
+  assert.match(sHtml,new RegExp(expected));
+ }
+});
