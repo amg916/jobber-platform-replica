@@ -44,8 +44,31 @@ test('Astra 6 audit: recurring webhook keys persist and cannot be overwritten',a
  db.exec('ALTER TABLE webhook_subscriptions DROP COLUMN delivered_keys_json');migrate(db);migrate(db);assert.deepEqual(JSON.parse(r.get('webhook_subscriptions',sub.id).delivered_keys_json),[]);emit(r,'invoice_overdue','invoices',invoice.id,'migrated-event');emit(r,'invoice_overdue','invoices',invoice.id,'migrated-event');assert.equal(r.get('webhook_subscriptions',sub.id).delivery_count,first.delivery_count+2);
 });
 
+function seedGraphQLTestFixtures(db){
+ const r=repository(db,1),w=workflows(db,1,1);
+ if(r.list('clients').length>0)return;
+ const c1=w.createClient({first_name:'Jane',last_name:'Doe',display_name:'Gary Barbier Construction',email:'jane@example.com',phone:'9165550101',billing_address:'100 Main St, Gold River, CA 95670',receives_email:1,receives_sms:1,status:'active'});
+ const c2=w.createClient({first_name:'Bob',last_name:'Smith',display_name:'Bob Smith',email:'bob@example.com',phone:'9165550102',billing_address:'200 Oak Ave, Gold River, CA 95670',receives_email:1,status:'lead'});
+ w.createClient({first_name:'Alice',last_name:'Jones',display_name:'Alice Jones',email:'alice@example.com',status:'active'});
+ const p1=r.insert('properties',{client_id:c1.id,street1:'100 Main St',city:'Gold River',state:'CA',postal_code:'95670',country:'United States',tax_rate:8.25,is_primary:1});
+ r.insert('properties',{client_id:c2.id,street1:'200 Oak Ave',city:'Gold River',state:'CA',postal_code:'95670',country:'United States',tax_rate:8.25,is_primary:1});
+ const s1=r.insert('products_services',{item_type:'service',name:'Tile Installation',description:'Tile service',category:'Services',unit:'sq ft',unit_cost_cents:500,markup_percent:100,unit_price_cents:1000,taxable:1,active:1});
+ r.insert('products_services',{item_type:'product',name:'Grout Sealer',description:'Sealer',category:'Supplies',unit:'unit',unit_cost_cents:1000,markup_percent:50,unit_price_cents:1500,taxable:1,active:1});
+ w.createRequest({client_id:c1.id,property_id:p1.id,title:'Tile Request'});
+ const q1=w.createQuote({client_id:c1.id,property_id:p1.id,title:'Tile Quote'},[{product_service_id:s1.id,name:'Tile Installation',quantity:10,unit_price_cents:1000,taxable:1}]);
+ const j1=w.createJob({client_id:c1.id,property_id:p1.id,quote_id:q1.id,title:'Tile Job',subtotal_cents:10000,total_cents:10000});
+ for(let i=2;i<=5;i++)w.createJob({client_id:c1.id,property_id:p1.id,title:'Tile Job '+i,subtotal_cents:10000,total_cents:10000});
+ w.createVisit(j1.id,{scheduled_start:'2026-11-01T09:00:00Z',scheduled_end:'2026-11-01T11:00:00Z',assigned_user_ids_json:[3],billable_amount_cents:10000});
+ w.createInvoice({client_id:c1.id,property_id:p1.id,job_id:j1.id,subject:'Tile Invoice'},[{product_service_id:s1.id,name:'Tile Installation',quantity:10,unit_price_cents:1000,taxable:1}]);
+ r.insert('expenses',{job_id:j1.id,user_id:1,item_name:'Thin-set mortar',accounting_code:'Materials',date_incurred:'2026-10-26',amount_cents:4500});
+ if(!db.prepare('SELECT id FROM organizations WHERE id=2').get()){
+  db.prepare("INSERT INTO organizations(id,name,slug) VALUES(2,'Second Tenant','second-tenant')").run();
+  repository(db,2).insert('clients',{display_name:'Second Tenant Client'});
+ }
+}
+
 async function fixture(t){
- const db=createDatabase();seedDatabase(db);const r=repository(db,1),owner=r.list('users')[0];db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword('test-password-123'),owner.id);
+ const db=createDatabase();seedDatabase(db);seedGraphQLTestFixtures(db);const r=repository(db,1),owner=r.list('users')[0];db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword('test-password-123'),owner.id);
  const server=await startServer({db,seed:false,port:0,oauthClients:{'test-app':{redirectUris:['https://example.test/callback']}}});t.after(async()=>{await server.close();db.close();});
  const call=async(path,{method='GET',data,headers={}}={})=>{const response=await fetch(server.url+path,{method,headers:{...(data?{'content-type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):undefined});const text=await response.text();return {status:response.status,headers:response.headers,body:response.headers.get('content-type')?.includes('json')?JSON.parse(text):text};};
  const login=await call('/api/auth/login',{method:'POST',data:{email:owner.email,password:'test-password-123'}});assert.equal(login.status,200);const headers={authorization:'Bearer '+login.body.token};
@@ -623,7 +646,7 @@ test('Astra 51: catalog target and relationship aliases normalize before storage
 
 test('Astra 52: job line items persist in SQLite across database reopen',async t=>{
  const dir=mkdtempSync(join(tmpdir(),'jobber-lines-')),dbPath=join(dir,'test.sqlite');let db=createDatabase(dbPath),server;
- t.after(async()=>{if(server)await server.close();db.close();rmSync(dir,{recursive:true,force:true});});seedDatabase(db);
+ t.after(async()=>{if(server)await server.close();db.close();rmSync(dir,{recursive:true,force:true});});seedDatabase(db);seedGraphQLTestFixtures(db);
  const owner=repository(db,1).list('users')[0],session='astra52-session';db.prepare('INSERT INTO sessions(token,user_id,organization_id,expires_at) VALUES(?,?,?,?)').run(session,owner.id,1,new Date(Date.now()+86400000).toISOString());
  server=await startServer({db,seed:false,port:0});
  const response=await fetch(server.url+'/api/graphql',{method:'POST',headers:{authorization:'Bearer '+session,'content-type':'application/json'},body:JSON.stringify({query:'mutation($input:Input!){jobCreate(input:$input){job{id totalCents lineItems{nodes{id legacyId name quantity unitPriceCents totalCents}}} userErrors{message}}}',variables:{input:{clientId:repository(db,1).list('clients')[0].id,title:'Persistent lines',lineItems:[{name:'Labor',unitPrice:12.34,quantity:2},{name:'Parts',unitPrice:5,quantity:1}]}}})});
@@ -1177,7 +1200,7 @@ test('Astra 100: REST deletions preserve legacy allocation floors across disk re
  for(const mode of ['sequence-first','lines-first','job']){
   const dir=mkdtempSync(join(tmpdir(),'jobber-astra100-')),dbPath=join(dir,'jobber.sqlite');let server;
   try{
-   server=await startServer({dbPath,port:0});const db=server.db,r=repository(db,1),clientId=r.list('clients')[0].id,owner=r.list('users')[0],job=r.insert('jobs',{client_id:clientId,title:'Deleted allocation'}),high=9000000;
+   server=await startServer({dbPath,port:0});const db=server.db,r=repository(db,1),clientId=(r.list('clients')[0]||r.insert('clients',{display_name:'Astra 100 Client'})).id,owner=r.list('users')[0],job=r.insert('jobs',{client_id:clientId,title:'Deleted allocation'}),high=9000000;
    db.prepare('INSERT INTO sessions(token,user_id,organization_id,expires_at) VALUES(?,?,?,?)').run('astra100',owner.id,1,new Date(Date.now()+60000).toISOString());
    const seq=r.insert('preferences',{name:'job_line_seq',value_json:String(high-1)}),lines=r.insert('preferences',{name:`job_lines:${job.id}`,value_json:JSON.stringify([{id:high,name:'Legacy line',unit_price_cents:100}])});
    const paths=mode==='job'?[`/api/jobs/${job.id}`,`/api/preferences/${seq.id}`]:mode==='sequence-first'?[`/api/preferences/${seq.id}`,`/api/preferences/${lines.id}`]:[`/api/preferences/${lines.id}`,`/api/preferences/${seq.id}`];

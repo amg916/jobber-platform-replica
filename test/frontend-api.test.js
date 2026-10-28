@@ -15,37 +15,20 @@ test('round four frontend parses and exposes task creation and reference table c
  assert.match(source,/\['Due date',/);assert.match(source,/\['Subject',/);
  assert.match(source,/Marketing Dashboard/);assert.match(source,/data-live-conversations/);
 });
-test('round four reference fixtures preserve real entities and an empty current schedule',t=>{
- const db=createDatabase();seedDatabase(db);t.after(()=>db.close());const r=repository(db,1);
- assert.equal(r.list('clients').length,95);
- assert.equal(r.get('clients',1).display_name,'Gary Barbier Construction');
- assert.equal(r.get('clients',1).billing_address,'6616 Butler Road, Penryn, California 95663');
- assert.equal(r.list('requests').length,3);assert.equal(r.list('quotes').length,3);
- assert.equal(r.list('jobs').length,5);assert.ok(r.list('jobs').every(j=>j.status==='late'));
- assert.equal(r.list('invoices').length,4);assert.equal(r.list('expenses').length,15);
- assert.equal(r.get('clients',1).status,'lead');assert.equal(r.get('clients',6).status,'active');
- assert.equal(r.get('clients',1).updated_at,'2026-10-13');
- assert.equal(r.get('clients',6).billing_address,'1994 Howell Mill Rd, Atlanta, Georgia 30318');
- assert.equal(r.get('clients',3).first_name,'');
- assert.equal(r.get('requests',1).property_id,r.list('properties',{client_id:6})[0].id);
- assert.equal(r.get('quotes',3).created_at,'2026-08-01');
- assert.equal(r.get('invoices',4).due_date,'2026-10-22');
- assert.equal(r.get('invoices',3).due_date,null);
- assert.equal(r.get('invoices',2).subject,'Surwald Bathroom Remodel');
- assert.equal(r.get('expenses',1).item_name,'From 8 to 4');
- assert.equal(r.get('expenses',1).amount_cents,0);
- const sum=(table,key='total_cents')=>r.list(table).reduce((n,x)=>n+x[key],0);
- assert.equal(sum('quotes'),14091500);assert.equal(sum('jobs'),23218500);
- assert.equal(sum('invoices'),14377750);assert.equal(sum('invoices','balance_due_cents'),14265000);
- assert.deepEqual(r.list('quotes').sort((a,b)=>a.quote_number-b.quote_number).map(q=>q.total_cents),[744000,1127500,12220000]);
- assert.deepEqual(r.list('jobs').sort((a,b)=>a.job_number-b.job_number).map(j=>j.total_cents),[7522000,1127500,1299000,1050000,12220000]);
- assert.equal(r.list('invoices',{status:'past_due'}).reduce((n,x)=>n+x.balance_due_cents,0),13250000);
- assert.equal(r.list('invoices',{status:'draft'})[0].total_cents,1015000);
- assert.equal(r.list('subscription_payments').length,4);
- assert.ok(r.list('expenses').every(e=>e.user_id===1&&e.date_incurred>='2026-07-01'&&e.date_incurred<='2026-10-31'));
- assert.equal(r.list('appointments').length,0);assert.equal(r.list('time_entries').length,0);
- assert.equal(r.list('messages').filter(m=>m.direction==='inbound').length,3);
- seedDatabase(db);assert.equal(r.list('clients').length,95);
+test('seedDatabase initializes J S Custom Tile team with zero dummy business records and is idempotent',t=>{
+ const db=createDatabase();t.after(()=>db.close());const r=repository(db,1);
+ const checkSeed=()=>{
+  assert.equal(db.prepare('SELECT count(*) n FROM organizations').get().n,1);
+  assert.equal(db.prepare('SELECT name FROM organizations WHERE id=1').get().name,'J S Custom Tile');
+  assert.equal(r.list('roles').length,4);assert.equal(r.list('users').length,4);
+  assert.deepEqual(r.list('users').map(u=>u.name).sort(),['Jack Surwald','Kyle Waterworth','Roger Burton','William Houn']);
+  for(const table of ['clients','properties','products_services','requests','quotes','jobs','visits','appointments','tasks','invoices','payments','expenses','subscription_payments','campaigns','notifications','messages'])assert.equal(r.list(table).length,0,table);
+ };
+ seedDatabase(db);checkSeed();
+ const organizations=db.prepare('SELECT * FROM organizations ORDER BY id').all(),roles=r.list('roles'),users=r.list('users');
+ seedDatabase(db);checkSeed();
+ assert.deepEqual(db.prepare('SELECT * FROM organizations ORDER BY id').all(),organizations);
+ assert.deepEqual(r.list('roles'),roles);assert.deepEqual(r.list('users'),users);
 });
 test('undefined optional values bind as null and malformed numbers are rejected',t=>{
  const db=createDatabase();seedDatabase(db);t.after(()=>db.close());const r=repository(db,1);
@@ -56,7 +39,8 @@ test('undefined optional values bind as null and malformed numbers are rejected'
 });
 test('booking observes local business hours, weekends, user availability and atomic rollback',t=>{
  const db=createDatabase();seedDatabase(db);t.after(()=>db.close());const w=workflows(db,1),r=w.r,count=r.list('clients').length;
- const data={service_id:1,customer_name:'Hours test',customer_email:'hours@example.com',assigned_user_ids_json:[3]};
+ const svc=r.insert('products_services',{name:'Tile Service',item_type:'service',unit_price_cents:10000,active:1});
+ const data={service_id:svc.id,customer_name:'Hours test',customer_email:'hours@example.com',assigned_user_ids_json:[3]};
  assert.throws(()=>w.book({...data,start_at:'2035-06-01T10:00:00Z',end_at:'2035-06-01T11:00:00Z'}),/business hours/);
  assert.throws(()=>w.book({...data,start_at:'2035-06-02T17:00:00Z',end_at:'2035-06-02T18:00:00Z'}),/business hours/);
  assert.equal(r.list('clients').length,count);
@@ -72,6 +56,8 @@ test('HTTP workspace bootstrap, static assets, document edits, pipeline, ledger 
  assert.equal((await fetch(server.url+'/assets/README.json')).status,404);
  const boot=await fetch(server.url+'/api/auth/bootstrap',{method:'POST'}),session=await boot.json();assert.equal(session.user.name,'Jack Surwald');
  const request=async(path,method='GET',body)=>{const response=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:response.status,value:await response.json()};};
+ const c1=(await request('clients','POST',{display_name:'Primary Client',email:'primary@example.com'})).value;
+ await request('requests','POST',{client_id:c1.id,title:'Initial Request'});
  const settings=(await request('settings')).value;
  assert.equal(settings.name,'J S Custom Tile');assert.equal(settings.phone,'9167518715');assert.equal(settings.website,'jscustomtile.com');assert.equal(settings.address,'11281 Pyrites Way');assert.equal(settings.city,'Gold River');assert.equal(settings.postal_code,'95670');
  const task=await request('tasks','POST',{title:'Round four task',due_date:'2026-10-26',assigned_user_id:1,status:'open'});
@@ -90,6 +76,11 @@ test('HTTP workspace bootstrap, static assets, document edits, pipeline, ledger 
  assert.equal((await request('clients/merge','POST',{source_id:duplicate.id,target_id:1})).status,200);
  assert.equal((await request('clients/'+duplicate.id)).value.status,'archived');
  assert.equal((await request('requests/'+linked.id)).value.client_id,1);
+ db.prepare("INSERT INTO organizations(id,name,slug) VALUES(2,'Second Org','second-org')").run();
+ const r2=repository(db,2),role2=r2.insert('roles',{name:'Owner',slug:'owner',is_system:1});
+ db.prepare('INSERT INTO permissions(role_id,resource,action,allowed) VALUES(?,?,?,1)').run(role2.id,'clients','read');
+ db.prepare('INSERT INTO permissions(role_id,resource,action,allowed) VALUES(?,?,?,1)').run(role2.id,'clients','write');
+ r2.insert('users',{role_id:role2.id,name:'Org2 Admin',email:'admin@org2.test',password_hash:'x',is_active:1});
  assert.equal((await request('auth/switch-org','POST',{organization_id:2})).status,200);
  assert.equal((await request('clients/merge','POST',{source_id:1,target_id:2})).status,404);
  assert.equal((await request('clients/1')).status,404);

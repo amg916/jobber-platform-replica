@@ -1,40 +1,38 @@
 # Known limitations
 
-## Verification and fidelity
+## Live data and minimal seed
 
-- Syntax/test execution was blocked by command approval; the Coordinator must run the documented checks. Fresh browser captures and direct pixel measurements are pending.
-- Exact 1:1 visual parity is not certified. Font fallbacks, promotional cropping, banner copy, toolbar geometry and overlay icon weights may still differ.
-- Existing screenshots/replica files are Round 2; do not use them as Round 3 proof.
-- Seed changes only apply to a new database. Existing jobber.sqlite is intentionally untouched.
+- The seed contract supplied for this update is that `seedDatabase` seeds only the J S Custom Tile organization, RBAC roles/permissions, and four team members. Dummy clients, transactions, campaigns, notifications, and other business fixtures have been removed from the seed. The seed implementation was not independently inspected in this change: the permitted scope was only `src/public/app.js` and this document.
+- Seed changes apply to newly initialized databases. Existing SQLite records are not removed by this frontend change; no database reset or cleanup was performed.
+- Business screens use the local API backed by SQLite. Home workflow values, appointment amounts, receivables, upcoming jobs, list statistics, client tags/properties, campaigns, and automation counts now use API records rather than reference-account totals. Empty records produce empty states or zero values, not synthetic business activity.
+- Date defaults use the current clock instead of October 2026 fixtures. The ISO date helpers format local calendar dates from the current runtime clock.
+- Quotes expose salesperson assignment/filtering; expenses expose review status and accounting codes. Record deletion, client property/contact creation, Settings collection editing, company/billing edits, and marketplace connection/sync controls call API mutation endpoints. Server authorization, validation, audit logging, and supported fields remain authoritative.
 
-## Customer-account and screen-parity items closed in implementation
+## Metric semantics
 
-1. J S Custom Tile catalog, Sacramento-metro synthetic clients, templates, five draft campaigns, automation copy, receptionist fixture and PDF fallback replace the remaining lawn-care defaults. Reference-client overrides, credentials, entity counts, totals and dates are preserved.
-2. Email Campaigns has a direct `/campaigns` route, generator and automation setup cards, eight-column campaign table, filters/search and sorting. Generate Email creates a deterministic draft locally; it does not call a live AI provider. Campaign creator/type labels are the requested Jack Surwald / One-off fixture presentation. Automated setup saves event-triggered rules, not a historical audience backfill. Job metrics default to zero because campaign job attribution is not stored.
-3. Reports includes all six category cards, including Expense reports. Mileage currently opens expenses rather than a separate mileage ledger. Client Hub settings includes the five additional toggle/preview blocks; the portal-behavior limitation below still applies.
-4. Workspace bootstrapping returns 59 unread notifications for a fresh seed. Opening Notifications clears the bell immediately, displays the fetched unread Activity count and asynchronously marks the organization's notifications read using client-read authorization.
-5. All requested sortable list columns now toggle ascending/descending while retaining active filters/search. The invoice Due date and Subject column literals are preserved.
-
-Regression tests for these items were added to `test/round5.test.js`.
-## Reference data
-
-- First six client identities/addresses and financial amounts match the requested fixtures. Remaining client names are synthetic.
-- Expense titles are requested fixtures; amounts, job assignments and dates are realistic generated values rather than exact reference transcription.
-- Today/6 minutes ago are special presentation labels for two reference records dated 2026-10-26, not a general relative-time engine. Home uses the screenshot's fixed date.
-- Initial current schedule and time-entry tables are empty. Marketing weekly summary starts at zero.
+- The requested Sent/Converted quote totals and Issued invoice totals are computed from loaded rows, although the cards retain their requested “Past 30 days” labels. They are not independently restricted to that period.
+- The requested recent-visit predicate includes every completed visit as well as visits scheduled within the past 30 days. Scheduled visits include all scheduled/in-progress visits, not only the next 30 days.
+- “Handled this week” displays the number of returned automation executions, without a separate frontend week filter.
+- Payout/deposit/refund cards summarize local payment records; they are not bank settlement statements. Average payment time uses paid invoices with payment and issue/creation dates.
+- Trend percentages are not shown without real comparison-period data. No synthetic percentage change is substituted.
+- Lookup requests that are unavailable fall back to empty collections. This preserves page rendering but can leave related names or metrics unavailable.
 
 ## Local product boundaries
 
-- Messaging, payments, accounting sync and AI operations are sandbox/deterministic implementations, not live provider integrations.
-- Receipt forwarding has an informational card but no email ingestion service or actual forwarded receipt storage.
-- Named request forms persist names but reuse the public booking page; a full field-by-field form designer is not provided.
-- Approval/payroll switches persist preferences but do not lock time entries, enforce an approval state machine or submit payroll.
-- Client Hub switches save settings; not all options are reflected in portal behavior.
-- Merging archives the source and moves relationships atomically, but has no undo flow. Source portal tokens do not automatically redirect to the retained client. Merge should be exercised on disposable fixture records during testing.
-- All seven list resources support keyboard/click column sorting with active search/status/resource filters retained. Sorting is local to the loaded records, not server-side pagination.
-- Reports open real local tables. Job-type and bad-debt reports filter their source data; taxation projects invoice tax fields. Payouts still shares payments and salesperson performance uses quote conversion without salesperson attribution. These are not full specialized reporting engines.
-- Existing subscription/rewards/product-update controls do not perform live subscription or promotional enrollment operations. Dark mode is a local visual toggle, not a fully audited dark-theme design system.
+- Messaging, payments, accounting sync, integration connections, and AI operations remain sandbox/deterministic implementations, not verified live provider integrations. Connect and Sync controls operate on local integration records.
+- Campaign generation creates a deterministic draft locally, not a live AI-generated response. Automated setup saves event-triggered rules, not a historical audience backfill. Campaign job attribution depends on fields supplied by the API.
+- Receipt forwarding remains informational; there is no email ingestion service or forwarded receipt storage.
+- Named request forms persist names but reuse the public booking page; a full field-by-field designer is not provided.
+- Approval/payroll switches persist preferences but do not lock time entries, enforce an approval state machine, or submit payroll.
+- Client Hub uses the returned organization name and honors returned menu visibility, quote approval, change-request, and request-form settings. Other preferences are not guaranteed to affect portal behavior. With no clients, the hub renders an explicitly non-transactional preview.
+- Merging archives the source and moves relationships, but has no undo flow. Source portal tokens do not automatically redirect to the retained client.
+- Sorting, search, and filters operate on loaded records rather than server-side pagination.
+- Reports use local tables. Mileage shares expenses, payouts shares payments, and salesperson performance uses quote conversion rather than a full salesperson reporting engine.
+- Subscription/rewards/product-update controls do not perform live subscription or promotional enrollment operations. Dark mode is not a fully audited theme system.
 
-## Delivery
+## Verification and delivery
 
-No commits, pushes, deployment, server edits, database reset or final external audit occurred. Coordinator owns test execution, final visual acceptance, collaboration release and any later fleet logging/delivery.
+- Only `src/public/app.js` and this document were read or edited for this task. Backend routes, schema, and seed contents were outside the authorized inspection scope.
+- `node --check src/public/app.js` was attempted but blocked because command approval was required. Syntax execution, automated tests, browser interaction checks, and fresh screenshots remain pending; frontend/backend contract compatibility is not certified.
+- Exact 1:1 visual parity is not certified. Existing screenshots are not evidence for this update.
+- No commits, pushes, deployment, database reset, or external audit were performed.

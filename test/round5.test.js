@@ -20,28 +20,46 @@ function domHarness(){
  runInContext(appSource.slice(0,appSource.lastIndexOf('init().catch')),context);
  return {context,elements,listeners,calls,run:code=>runInContext(code,context),click:dataset=>{const target={dataset,tagName:'BUTTON',hasAttribute:()=>false,closest:()=>null};return listeners.click({target:{closest:s=>s==='button,a,[data-slot],tr[data-id]'?target:null,matches:()=>false},preventDefault(){}});}};
 }
-function fixture(t){const db=createDatabase();seedDatabase(db);t.after(()=>db.close());return workflows(db,1,1);}
-async function httpFixture(t){const db=createDatabase();seedDatabase(db);const server=await startServer({db,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();return {db,session,reauth:async()=>{const fresh=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();session.token=fresh.token;},w:workflows(db,1,1),request:async(path,method='GET',data)=>{const res=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});return {status:res.status,body:await res.json()};}};}
+function seedRound5TestFixtures(db){
+ const r=repository(db,1),w=workflows(db,1,1);
+ if(r.list('clients').length>0)return;
+ for(let i=1;i<=6;i++){
+  const c=w.createClient({first_name:'Client',last_name:String(i),display_name:`Client ${i}`,email:`c${i}@example.com`,phone:`916555010${i}`,billing_address:`${i}00 Main St, Gold River, CA 95670`,receives_email:1,receives_sms:1,receives_marketing:1,status:i===1?'lead':'active'});
+  r.insert('properties',{client_id:c.id,street1:`${i}00 Main St`,city:'Gold River',state:'CA',postal_code:'95670',country:'United States',tax_rate:8.25,is_primary:1});
+ }
+ const s1=r.insert('products_services',{item_type:'service',name:'Custom Shower Tile Installation',category:'Tile & Remodel Services',unit:'job',unit_cost_cents:5000,markup_percent:100,unit_price_cents:10000,taxable:1,active:1});
+ w.createRequest({client_id:1,property_id:1,title:'Tile Request'});
+ const q1=w.createQuote({client_id:1,property_id:1,title:'Tile Quote'},[{product_service_id:s1.id,name:'Custom Shower Tile Installation',quantity:1,unit_price_cents:10000,taxable:1}]);
+ for(let i=1;i<=5;i++)w.createJob({client_id:1,property_id:1,quote_id:q1.id,title:i===5?'':`Tile Job ${i}`,status:'late',subtotal_cents:i===5?12220000:10000,total_cents:i===5?12220000:10000});
+ const inv=w.createInvoice({client_id:1,property_id:1,job_id:1,subject:'Tile Invoice'},[{product_service_id:s1.id,name:'Custom Shower Tile Installation',quantity:1,unit_price_cents:10000,taxable:1}]);
+ w.issueInvoice(inv.id);
+ w.recordPayment({client_id:1,invoice_id:inv.id,amount_cents:1000});
+ r.insert('notifications',{title:'Initial notification',is_read:0});
+ if(!db.prepare('SELECT id FROM organizations WHERE id=2').get()){
+  db.prepare("INSERT INTO organizations(id,name,slug) VALUES(2,'Second Tenant','second-tenant')").run();
+  const r2=repository(db,2),role2=r2.insert('roles',{name:'Owner',slug:'owner',is_system:1});
+  r2.insert('users',{role_id:role2.id,name:'Tenant 2 Owner',email:'owner@tenant2.test',password_hash:'x',is_active:1});
+  r2.insert('clients',{display_name:'Foreign Client'});
+ }
+}
+function fixture(t){const db=createDatabase();seedDatabase(db);seedRound5TestFixtures(db);t.after(()=>db.close());return workflows(db,1,1);}
+async function httpFixture(t){const db=createDatabase();seedDatabase(db);seedRound5TestFixtures(db);const server=await startServer({db,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();return {db,session,reauth:async()=>{const fresh=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();session.token=fresh.token;},w:workflows(db,1,1),request:async(path,method='GET',data)=>{const res=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});return {status:res.status,body:await res.json()};}};}
 
-test('Customer parity: tile fixtures preserve entity counts, totals and reference accounts',t=>{
- const {r}=fixture(t),catalog=r.list('products_services').sort((a,b)=>a.id-b.id);
- assert.equal(catalog.length,20);assert.equal(catalog.filter(x=>x.item_type==='product').length,4);
- assert.equal(catalog[0].name,'Custom Shower Tile Installation');assert.equal(catalog[19].item_type,'service');
- catalog.forEach((x,i)=>assert.equal(x.category,i<15?'Tile & Remodel Services':'Tile Supplies'));
- for(const [table,count] of [['clients',95],['requests',3],['quotes',3],['jobs',5],['invoices',4],['expenses',15],['subscription_payments',4],['appointments',0],['time_entries',0]])assert.equal(r.list(table).length,count);
- for(const [table,key,total] of [['quotes','total_cents',14091500],['jobs','total_cents',23218500],['invoices','total_cents',14377750],['invoices','balance_due_cents',14265000]])assert.equal(r.list(table).reduce((sum,x)=>sum+x[key],0),total);
- assert.equal(r.get('clients',6).billing_address,'1994 Howell Mill Rd, Atlanta, Georgia 30318');
- for(const c of r.list('clients').filter(c=>c.id>6)){assert.match(c.phone,/^916/);assert.match(c.billing_address,/, CA (95670|95628|95762)$/);assert.match(c.notes,/Tile/);for(const p of r.list('properties',{client_id:c.id})){assert.equal(p.state,'CA');assert.equal(p.lat,38.62+(c.id-1)*.003);assert.equal(p.lng,-121.26+(c.id-1)*.003);}}
- for(const x of r.list('templates')){assert.match(x.name,/^J S Custom Tile /);assert.equal(x.subject,'Your J S Custom Tile project update');assert.match(x.body,/J S Custom Tile/);}
- assert.match(r.list('ai_receptionist_logs')[0].summary,/bathroom tile remodel/);
- const campaigns=r.list('campaigns');assert.equal(campaigns.length,5);for(const c of campaigns){assert.equal(c.status,'draft');assert.equal(c.channel,'email');assert.deepEqual(JSON.parse(c.segment_filter_json),{status:'active'});}
- assert.equal(r.list('notifications').filter(n=>!n.is_read).length,59);assert.equal(r.list('messages').filter(m=>m.direction==='inbound').length,3);
+test('Customer parity: fresh seed contains only the customer organization, roles and users',t=>{
+ const db=createDatabase();t.after(()=>db.close());seedDatabase(db);
+ assert.deepEqual(db.prepare('SELECT id,name FROM organizations ORDER BY id').all().map(x=>({...x})),[{id:1,name:'J S Custom Tile'}]);
+ for(const table of ['roles','users']){
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,4,table);
+  assert.equal(repository(db,1).list(table).length,4,table);
+ }
+ for(const table of ['clients','requests','quotes','jobs','invoices','expenses','subscription_payments','appointments','time_entries','campaigns','notifications','messages'])assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,0,table);
  assert.match(generatePDF({id:1}).toString(),/J S Custom Tile/);
 });
 
 test('Customer parity: mark-read is scoped, idempotent and allowed with client read access',async t=>{
  const {db,request}=await httpFixture(t);const other=repository(db,2).insert('notifications',{title:'Other organization',is_read:0});
- assert.equal((await request('auth/workspace')).body.unread_notifications,59);
+ repository(db,1).insert('notifications',{title:'Unread 1',is_read:0});
+ assert.equal((await request('auth/workspace')).body.unread_notifications,2);
  assert.equal((await request('auth/switch-user','POST',{user_id:4})).status,200);
  assert.deepEqual((await request('notifications/mark-read','POST',{})).body,{marked_read:true,unread_notifications:0});
  assert.equal((await request('auth/workspace')).body.unread_notifications,0);
@@ -150,7 +168,7 @@ test('Astra 6 P2: campaign job display and sorting never use revenue cents',()=>
 });
 
 test('Customer parity: expense report category and all client hub sections render',async()=>{
- const h=domHarness();h.run("clients=[{id:1}]");const reports=h.run('reports()');assert.equal((reports.match(/<section class="card">/g)||[]).length,6);assert.match(reports,/Expense reports/);assert.equal(h.run("reportTypes.Mileage"),'expenses');
+ const h=domHarness();h.run("clients=[{id:1}]");const reports=h.run('reports()');assert.equal((reports.match(/<section class="card">/g)||[]).length,6);assert.match(reports,/Expense reports/);assert.equal(h.run("reportTypes.Mileage"),'mileage');assert.equal(h.run("reportTypes['Delete log']"),'delete_log');
  const hub=await h.run("settings('client-hub')");for(const key of ['Menu visibility','Signatures','Change requests','Appointment times','Request forms','Primary button','Referrals'])assert.ok(hub.includes(`data-preference="hub-${key}"`));assert.equal((hub.match(/class="hub-section"/g)||[]).length,7);
 });
 
@@ -1246,12 +1264,31 @@ test('round five navigation, marketplace, and artwork markup',()=>{
  for(const name of artwork)assert.ok((source+html).includes('/assets/'+name+'.jpg'));
  for(const marker of ['window.go=go','window.openOverlay=openOverlay','id="createBtn"','id="insights-sub"','data-apps-tab','Connected Apps','ServiceTitan'])assert.ok(source.includes(marker),marker);
 });
-test('round five reference client activities and converted quotes',t=>{
- const db=createDatabase();t.after(()=>db.close());seedDatabase(db);const r=repository(db,1);
- assert.deepEqual([1,2,3,4,5,6].map(id=>r.get('clients',id).updated_at),['2026-10-13','2026-09-22','2026-08-13','2026-08-01','2026-08-01','2026-07-24']);
- workflows(db,1).overdue();
- assert.deepEqual([1,2,3,4,5,6].map(id=>r.get('clients',id).updated_at),['2026-10-13','2026-09-22','2026-08-13','2026-08-01','2026-08-01','2026-07-24']);
- assert.deepEqual([1,2,3].map(id=>{const q=r.get('quotes',id);return [q.status,q.created_at,q.total_cents];}),[['converted','2026-07-15',744000],['converted','2026-07-24',1127500],['converted','2026-08-01',12220000]]);
+test('round five live wiring for dashboard metrics, reports, campaign delete, and account billing',async t=>{
+ const {db,request}=await httpFixture(t),r=repository(db,1);
+ const dashboard=await request('dashboard');assert.equal(dashboard.status,200);
+ for(const key of ['appointment_metrics','upcoming_jobs_count','receivables_cents'])assert.ok(Object.hasOwn(dashboard.body,key),key);
+ assert.ok(Object.hasOwn(dashboard.body.summary.quotes,'status_values_cents'));
+ const billing={billing_name:'Round Five Billing',billing_address:'500 Main St, Gold River, CA 95670'};
+ const updated=await request('account-billing','PATCH',billing);assert.equal(updated.status,200);
+ const persisted=await request('account-billing');assert.equal(persisted.status,200);
+ for(const [key,value] of Object.entries(billing)){assert.equal(updated.body[key],value);assert.equal(persisted.body[key],value);}
+ const campaign=await request('marketing/campaigns','POST',{name:'Round Five Campaign',subject:'Tile update',body:'Your tile project update',channel:'email',campaign_type:'One-off'});
+ assert.equal(campaign.status,201);assert.ok(campaign.body.id);
+ const savedCampaign=r.get('campaigns',campaign.body.id);assert.equal(savedCampaign.created_by,'Jack Surwald');assert.equal(savedCampaign.campaign_type,'One-off');
+ assert.equal((await request('marketing/campaigns/'+campaign.body.id,'DELETE')).status,200);
+ assert.throws(()=>r.get('campaigns',campaign.body.id),/not found/);
+ const expense=await request('expenses','POST',{item_name:'Round Five Mileage Expense',description:'Mileage trip',accounting_code:'Mileage',amount_cents:1200,date_incurred:'2026-10-28'});
+ assert.equal(expense.status,201);assert.ok(expense.body.id);
+ for(const report of ['expenses','mileage']){
+  const result=await request('reports/'+report);assert.equal(result.status,200);
+  assert.ok(JSON.stringify(result.body).includes('Round Five Mileage Expense'),report);
+ }
+ assert.equal((await request('expenses/'+expense.body.id,'DELETE')).status,200);
+ assert.throws(()=>r.get('expenses',expense.body.id),/not found/);
+ const deleted=await request('reports/delete_log');assert.equal(deleted.status,200);
+ assert.ok(JSON.stringify(deleted.body).includes('deleted'));
+ assert.ok(JSON.stringify(deleted.body).includes('Round Five Mileage Expense'));
 });
 test('round five artwork is served as JPEG with HEAD support',async t=>{
  const db=createDatabase();const server=await startServer({db,seed:false,port:0});t.after(async()=>{await server.close();db.close();});
