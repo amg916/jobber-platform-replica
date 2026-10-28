@@ -1373,8 +1373,13 @@ test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, com
  for(const text of ['Test Receptionist','A dedicated phone number is required','Time Saved','Workflows Created','Call history & Conversations'])assert.match(recHtml,new RegExp(text));
  const mktQuiet=await h.run("marketingTab='Dashboard';fetch=async()=>({ok:true,json:async()=>[]});marketing()");
  for(const text of ['GOOGLE BUSINESS PROFILE','REFERRALS','CREATE WEBSITE','All quiet this week — your automations are standing by\\.'])assert.match(mktQuiet,new RegExp(text));
- for(const [page,expected] of [['business-profile','Essential information'],['work-settings','Payment terms'],['schedule','Appointment layout'],['location-services','Location timers'],['dedicated-phone-number','Dedicated Phone Number'],['expense-tracking','Accounting codes'],['account-connections','Google Business Profile']]){
+ for(const [page,expected] of [['business-profile','Essential information'],['work-settings','Payment terms'],['schedule','Appointment layout'],['location-services','Location timers'],['dedicated-phone-number','Dedicated Phone Number'],['expense-tracking','Accounting codes'],['account-connections','Google Business Profile'],['jobber-payments','Tap to Pay on iPhone'],['manage-team','4/5 seats assigned'],['emails-and-text-messages','Automations Settings'],['products-and-services','Import products & services'],['custom-fields','Client custom fields']]){
   const sHtml=await h.run(`settings('${page}')`);
   assert.match(sHtml,new RegExp(expected));
  }
+ assert.match(h.run('paymentDisputes()'),/Payment disputes/);
+ assert.match(await h.run("paymentTab='Payouts';listPage('payments')"),/You have not received a bank payout yet/);
+ assert.match(await h.run("receptionistTab='Manage';receptionist()"),/Get started with Receptionist/);
+ assert.match(await h.run("marketingTab='Website';marketing()"),/If you have a minute, we have your website/);
+ assert.match(await h.run("marketingTab='Performance';marketing()"),/Your marketing performance/);
 });
