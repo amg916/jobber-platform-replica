@@ -8,6 +8,7 @@ import { createDatabase, repository } from '../src/db/database.js';
 import { seedDatabase } from '../src/db/seed.js';
 import { workflows } from '../src/services/workflows.js';
 import { startServer } from '../src/server.js';
+import { deliverWebhook, emit } from '../src/services/automations.js';
 
 const appSource=readFileSync(new URL('../src/public/app.js',import.meta.url),'utf8');
 function domHarness(){
@@ -19,7 +20,856 @@ function domHarness(){
  return {context,elements,listeners,calls,run:code=>runInContext(code,context),click:dataset=>{const target={dataset,tagName:'BUTTON',hasAttribute:()=>false,closest:()=>null};return listeners.click({target:{closest:s=>s==='button,a,[data-slot],tr[data-id]'?target:null,matches:()=>false},preventDefault(){}});}};
 }
 function fixture(t){const db=createDatabase();seedDatabase(db);t.after(()=>db.close());return workflows(db,1,1);}
-async function httpFixture(t){const db=createDatabase();seedDatabase(db);const server=await startServer({db,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();return {db,w:workflows(db,1,1),request:async(path,method='GET',data)=>{const res=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});return {status:res.status,body:await res.json()};}};}
+async function httpFixture(t){const db=createDatabase();seedDatabase(db);const server=await startServer({db,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();return {db,session,reauth:async()=>{const fresh=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();session.token=fresh.token;},w:workflows(db,1,1),request:async(path,method='GET',data)=>{const res=await fetch(server.url+'/api/'+path,{method,headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});return {status:res.status,body:await res.json()};}};}
+
+test('Astra 6 P2: OAuth refresh transfers revision ownership and logout clears it',async t=>{
+ const {w,request,session}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'OAuth revision',field_key:'oauth_revision',field_type:'text'});
+ const authenticate=async()=>{const grant=await request('oauth/authorize','POST',{response_type:'code',client_id:'revision-test'});assert.equal(grant.status,200);const result=await request('oauth/token','POST',{grant_type:'authorization_code',client_id:'revision-test',code:grant.body.code});assert.equal(result.status,200);return result.body;},initial=session.token;
+ const save=(revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'jobs',entity_id:1,rev_scope:'oauth-refresh',revision,value_text});
+ const a=await authenticate();session.token=a.access_token;
+ const first=await save(5,'A5');assert.equal(first.status,201);assert.equal(first.body.value_text,'A5');
+ const refreshed=await request('oauth/token','POST',{grant_type:'refresh_token',client_id:'revision-test',refresh_token:a.refresh_token});assert.equal(refreshed.status,200);session.token=refreshed.body.access_token;
+ const stale=await save(1,'Stale B');assert.equal(stale.status,200);assert.equal(stale.body.value_text,'A5');
+ const second=await save(6,'B6');assert.equal(second.status,200);assert.equal(second.body.value_text,'B6');
+ assert.equal((await request('auth/logout','POST',{})).status,200);
+ session.token=initial;const c=await authenticate();session.token=c.access_token;
+ const fresh=await save(1,'C1');assert.equal(fresh.status,200);assert.equal(fresh.body.value_text,'C1');assert.equal(w.r.get('custom_field_values',first.body.id).value_text,'C1');
+});
+
+test('Astra 6 P2: visit deletion preserves unrelated custom automation keys',async t=>{
+ const {w,request}=await httpFixture(t),visit=w.createVisit(1),client=w.createClient({display_name:'Unrelated automation client'}),rule=w.r.insert('automations',{name:'Visit cleanup',trigger_event:'visit_approaching',action_type:'create_task',is_enabled:1}),rule2=w.r.insert('automations',{name:'Visit cleanup 2',trigger_event:'visit_approaching',action_type:'create_task',is_enabled:1});
+ const add=(entity_type,entity_id,key,rId=rule.id)=>w.r.insert('automation_executions',{automation_id:rId,trigger_event:'visit_approaching',entity_type,entity_id,idempotency_key:`${rId}:${key}`,status:'queued',scheduled_for:'2099-01-01T00:00:00.000Z'});
+ const keep=[add('clients',client.id,`external:visit:${visit.id}`),add('clients',client.id,`visit:${visit.id}`),add('jobs',visit.job_id,`external:visit:${visit.id}`,rule2.id)];
+ const remove=[add('jobs',visit.job_id,`visit:${visit.id}`,rule2.id),add('jobs',visit.job_id,`reminder:${visit.id}:2099-01-01`),add('visits',visit.id,`reminder:${visit.id}:2099-01-02`)];
+ const retainedKeys=[`external:visit:${visit.id}`,`visit:${visit.id}:custom`,`reminder:${visit.id}`,`reminder:${visit.id}:`],sub=w.r.insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/hook',secret:'test',active:1,delivered_keys_json:JSON.stringify([...retainedKeys,`visit:${visit.id}`,`reminder:${visit.id}:2099-01-01`,`visit_completed:visits:${visit.id}:99`])});
+ assert.equal((await request('visits/'+visit.id,'DELETE')).status,200);
+ const ids=new Set(w.r.list('automation_executions').map(row=>row.id));for(const row of keep)assert.ok(ids.has(row.id));for(const row of remove)assert.ok(!ids.has(row.id));
+ assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),retainedKeys);
+});
+
+test('Astra 6 P2: newer search and settings panels supersede pending responses',async()=>{
+ for(const query of ['', 'tile']){
+  const h=domHarness();h.elements.set('.global-search',{value:query});
+  h.run("user={name:'Test User'};org={email:'test@example.test'};activeDetailKey='clients:1'");
+  let resolvePreferences;
+  h.context.fetch=async path=>({ok:true,json:()=>path==='/api/preferences'?new Promise(resolve=>{resolvePreferences=resolve;}):[]});
+  const pending=h.run("globalPanel('settings')");
+  await Promise.resolve();await Promise.resolve();
+  await h.run('globalSearch()');
+  const html=h.elements.get('#overlay').innerHTML;
+  assert.match(html,query?/Search results/:/Search your workspace/);
+  assert.equal(h.run('activeDetailKey'),'');
+  resolvePreferences([]);await pending;
+  assert.equal(h.elements.get('#overlay').innerHTML,html);
+ }
+ const h=domHarness();h.elements.set('.global-search',{value:'tile'});
+ h.context.document.body={classList:{contains:()=>false}};
+ h.run("user={name:'Test User'};org={email:'test@example.test'}");
+ const pendingResults=[];
+ h.context.fetch=async path=>({ok:true,json:()=>path==='/api/preferences'?[]:new Promise(resolve=>pendingResults.push(resolve))});
+ const pending=h.run('globalSearch()');
+ await h.run("globalPanel('settings')");
+ const html=h.elements.get('#overlay').innerHTML;assert.match(html,/settings-menu/);
+ for(const resolve of pendingResults)resolve([]);
+ await pending;assert.equal(h.elements.get('#overlay').innerHTML,html);
+});
+
+test('Astra 6 P2: null event keys generate deduplicated deliveries and invalid keys fail',async t=>{
+ const {w,request}=await httpFixture(t),client=w.createClient({display_name:'Null key client'});
+ const sub=w.r.insert('webhook_subscriptions',{topic:'invoice_overdue',target_url:'https://example.test/hook',secret:'test',active:1});
+ const rule=w.r.insert('automations',{name:'Null key rule',trigger_event:'invoice_overdue',action_type:'create_task',is_enabled:1});
+ const data={event:'invoice_overdue',entity_type:'clients',entity_id:client.id,event_key:null};
+ const first=await request('automations/run','POST',data),second=await request('automations/run','POST',data);
+ assert.equal(first.status,200);assert.equal(second.status,200);assert.deepEqual(second.body,first.body);
+ const key=`invoice_overdue:clients:${client.id}`,saved=w.r.get('webhook_subscriptions',sub.id);
+ assert.equal(saved.delivery_count,1);assert.deepEqual(JSON.parse(saved.delivered_keys_json),[key]);
+ assert.ok(first.body.some(r=>r.idempotency_key===`${rule.id}:${key}`));
+ for(const event_key of ['', ' \t ', 0, 42, false, true, [], {}]){
+  const result=await request('automations/run','POST',{...data,event_key});
+  assert.equal(result.status,400);assert.equal(result.body.error,'Invalid event key');
+ }
+ assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,1);
+ for(const event_key of ['  explicit-key  ','explicit-key'])assert.equal((await request('automations/run','POST',{...data,event_key})).status,200);
+ assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,2);
+ assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),[key,'explicit-key']);
+});
+
+test('Astra 6 P3: billing normalizes accepted null, primitive and malformed preference fields',async t=>{
+ const {request}=await httpFixture(t);
+ const cases=[...['null','false','42','"plan"','[]'].map(value_json=>[value_json,'Plus Monthly',59900,[]]),
+  [JSON.stringify({plan:42,price_cents:-1,addons:'Marketing'}),'Plus Monthly',59900,[]],
+  [JSON.stringify({plan:' ',price_cents:'3900',addons:{}}),'Plus Monthly',59900,[]],
+  [JSON.stringify({plan:'Core',price_cents:null,addons:null}),'Core',59900,[]],
+  [JSON.stringify({plan:'Core',price_cents:3900.6,addons:['Marketing',null,1,{}]}),'Core',3901,['Marketing']],
+  [JSON.stringify({plan:'Core',price_cents:0,addons:[]}),'Core',0,[]]];
+ for(const [value_json,plan,price_cents,addons] of cases){
+  const saved=await request('preferences','POST',{name:'account-plan',value_json});assert.ok([200,201].includes(saved.status));
+  const billing=await request('account-billing');assert.equal(billing.status,200);
+  assert.equal(billing.body.plan,plan);assert.equal(billing.body.price_cents,price_cents);assert.deepEqual(billing.body.addons,addons);
+  const h=domHarness();h.context.fetch=async()=>({ok:true,json:async()=>billing.body});
+  await h.run("gapAction('subscription')");assert.match(h.elements.get('#overlay').innerHTML,/Manage Plan/);
+  assert.match(await h.run("settings('account-billing')"),/Account and billing/);
+ }
+});
+
+test('Astra 6 P2: UI preference readers tolerate saved null and primitive values',async t=>{
+ const {request}=await httpFixture(t);
+ for(const value_json of ['null','false','0','42','"text"','[]']){
+  for(const name of ['workspace-language','product-updates','rewards-claimed','request-form-null']){
+   const saved=await request('preferences','POST',{name,value_json});assert.ok([200,201].includes(saved.status));
+  }
+  const prefs=await request('preferences'),h=domHarness();
+  h.context.document.body={classList:{contains:()=>false}};
+  h.run("user={name:'Test User'};org={email:'test@example.test'}");
+  h.context.fetch=async path=>({ok:true,json:async()=>path==='/api/preferences'?prefs.body:[]});
+  await h.run("globalPanel('settings')");assert.match(h.elements.get('#overlay').innerHTML,/English \(US\)/);
+  for(const action of ['updates','language','rewards'])await h.run(`gapAction('${action}')`);
+  assert.match(await h.run("settings('requests-and-bookings')"),/Forms/);
+ }
+});
+
+test('Astra 6 P2: failed client deletion preserves custom field revision protection',async t=>{
+ const {w,request}=await httpFixture(t),client=w.createClient({display_name:'Protected client'});
+ w.createQuote({client_id:client.id,title:'Dependent quote'});
+ const field=w.r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Access',field_key:'delete_guard',field_type:'text'});
+ const save=(revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'clients',entity_id:client.id,rev_scope:'failed-delete',revision,value_text});
+ const saved=await save(2,'Latest');assert.equal(saved.status,201);
+ const deleted=await request(`clients/${client.id}`,'DELETE');assert.equal(deleted.status,400);assert.match(deleted.body.error,/FOREIGN KEY/i);
+ assert.equal(w.r.get('clients',client.id).id,client.id);assert.equal(w.r.get('custom_field_values',saved.body.id).value_text,'Latest');
+ const delayed=await save(1,'Stale');assert.equal(delayed.status,200);assert.equal(delayed.body.value_text,'Latest');
+ assert.equal(w.r.get('custom_field_values',saved.body.id).value_text,'Latest');
+});
+
+test('Astra 6 P2: failed custom field reads cannot expose defaults or save over persisted values',async t=>{
+ const {w,request}=await httpFixture(t),client=w.createClient({display_name:'Read failure client'});
+ const field=w.r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Access',field_key:'read_guard',field_type:'text',default_value:'Unsafe fallback'});
+ const saved=w.r.insert('custom_field_values',{field_definition_id:field.id,entity_type:'clients',entity_id:client.id,value_text:'Persisted access'});
+ for(const endpoint of ['custom-field-values','custom-fields']){
+  const h=domHarness();let writes=0;
+  h.context.fetch=async(path,options={})=>{
+   if(options.method&&options.method!=='GET')writes++;
+   if(path==='/api/'+endpoint)return {ok:false,status:500,json:async()=>({error:'Read failed'})};
+   const result=await request(path.slice(5),options.method||'GET',options.body?JSON.parse(options.body):undefined);
+   return {ok:result.status<400,status:result.status,json:async()=>result.body};
+  };
+  await h.run(`detail('clients',${client.id})`);
+  const html=h.elements.get('#overlay').innerHTML;
+  assert.match(html,/<h3>Custom Fields<\/h3><p>Unable to load custom fields\.<\/p>/);
+  assert.doesNotMatch(html,/id="custom-|save-custom-field:|Unsafe fallback/);
+  await assert.rejects(h.run(`gapAction('save-custom-field:${field.id}:clients:${client.id}')`),/Custom field unavailable/);
+  h.elements.set('#custom-'+field.id,{value:'Unsafe fallback',disabled:true});
+  await assert.rejects(h.run(`gapAction('save-custom-field:${field.id}:clients:${client.id}')`),/Custom field unavailable/);
+  assert.equal(writes,0);assert.equal(w.r.get('custom_field_values',saved.id).value_text,'Persisted access');
+ }
+});
+
+test('Astra 6 P2: supplementary read failures render unavailable sections without controls',async()=>{
+ for(const [endpoint,section,control] of [['tags','tags','add-entity-tag'],['entity-tags','tags','add-entity-tag'],['checklists','checklists','add-checklist-item'],['checklist-items','checklists','add-checklist-item'],['attachments','attachments','add-attachment']]){
+  const h=domHarness();h.context.fetch=async path=>({ok:path!=='/api/'+endpoint,status:path==='/api/'+endpoint?500:200,json:async()=>path==='/api/'+endpoint?{error:'Read failed'}:[]});
+  const html=await h.run("entitySections('jobs',1)");
+  assert.ok(html.includes(`<p>Unable to load ${section}.</p>`));assert.ok(!html.includes(control));
+ }
+});
+
+test('Final audit: deleted clients and jobs do not transfer polymorphic metadata to reused IDs',async t=>{
+ const {w,request}=await httpFixture(t);
+ for(const entity_type of ['clients','jobs']){
+  const create=()=>entity_type==='clients'?w.createClient({display_name:'Metadata owner'}):w.createJob({client_id:1,title:'Metadata owner'});
+  const row=create(),entity_id=row.id,tag=w.r.insert('tags',{name:'Old metadata'}),field=w.r.insert('custom_field_definitions',{entity_type,field_name:'Old metadata',field_key:'old_'+entity_type,field_type:'text'});
+  w.r.insert('entity_tags',{entity_type,entity_id,tag_id:tag.id});w.r.insert('attachments',{entity_type,entity_id,file_name:'old.txt',content_text:'Old attachment'});
+  const save=(revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type,entity_id,rev_scope:'reuse',revision,value_text});
+  assert.equal((await save(10,'Old value')).status,201);
+  const activity=w.r.insert('activity_logs',{entity_type,entity_id,action:'metadata'}),message=w.r.insert('messages',{related_entity_type:entity_type,related_entity_id:entity_id,body:'Old message'}),notification=w.r.insert('notifications',{entity_type,entity_id,title:'Old notification'});
+  assert.equal((await request(`${entity_type}/${entity_id}`,'DELETE')).status,200);
+  assert.equal(create().id,entity_id);
+  for(const table of ['entity_tags','custom_field_values','attachments'])assert.deepEqual(w.r.list(table,{entity_type,entity_id}),[]);
+  assert.equal(w.r.get('activity_logs',activity.id).entity_id,null);assert.equal(w.r.get('messages',message.id).related_entity_id,null);assert.equal(w.r.get('notifications',notification.id).entity_id,null);
+  assert.equal((await save(1,'Replacement')).status,201);assert.equal((await save(2,'Updated replacement')).body.value_text,'Updated replacement');
+ }
+});
+test('Final audit: moved and recreated custom values reset revision guards',async t=>{
+ const {db,w,request}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Moved value',field_key:'moved_value',field_type:'text'});
+ for(const method of ['PATCH','PUT','recreate']){
+  const source=w.createClient({display_name:'Source'}),destination=w.createClient({display_name:'Destination'});
+  const save=(entity_id,revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'clients',entity_id,rev_scope:'move',revision,value_text});
+  const original=await save(source.id,10,'Original');assert.equal(original.status,201);
+  if(method==='recreate')db.prepare('DELETE FROM custom_field_values WHERE id=?').run(original.body.id);
+  else {
+   const prior=await save(destination.id,20,'Destination');assert.equal(prior.status,201);
+   // Leave a stale destination guard to verify that moving clears both keys.
+   db.prepare('DELETE FROM custom_field_values WHERE id=?').run(prior.body.id);
+   assert.equal((await request(`custom-field-values/${original.body.id}`,method,{entity_id:destination.id})).status,200);
+   assert.equal((await save(destination.id,1,'Moved update')).body.value_text,'Moved update');
+  }
+  assert.equal((await save(source.id,1,'Recreated')).status,201);
+  const updated=await save(source.id,2,'Revision two');assert.equal(updated.status,200);assert.equal(updated.body.value_text,'Revision two');
+  assert.equal(w.r.get('custom_field_values',updated.body.id).value_text,'Revision two');
+ }
+});
+test('Final audit: completed uninvoiced jobs can complete and move to Invoiced',async t=>{
+ const {w,request}=await httpFixture(t);
+ for(const explicitCompletion of [true,false]){
+  const job=w.createJob({client_id:1,title:'Completed uninvoiced',status:'completed',subtotal_cents:1000,total_cents:1000});
+  assert.deepEqual(w.r.list('invoices',{job_id:job.id}),[]);
+  if(explicitCompletion){const completed=await request(`jobs/${job.id}/complete`,'POST',{});assert.equal(completed.status,200);assert.equal(completed.body.status,'requires_invoicing');}
+  const moved=await request('pipeline','POST',{resource:'jobs',id:job.id,stage:'Invoiced'});
+  assert.equal(moved.status,200);assert.equal(moved.body.job_id,job.id);assert.equal(moved.body.status,'awaiting_payment');assert.equal(moved.body.total_cents,1000);
+  assert.equal(w.r.get('jobs',job.id).status,'completed');assert.equal(w.r.list('invoices',{job_id:job.id}).length,1);
+  const retry=await request(`jobs/${job.id}/complete`,'POST',{});assert.equal(retry.status,200);assert.equal(retry.body.status,'completed');
+ }
+});
+
+test('Final audit: typing while either checklist endpoint loads survives drawer refresh',async()=>{
+ for(const endpoint of ['checklists','checklist-items']){
+  const h=domHarness(),input={value:'Before loading'};let release,reached;
+  const gate=new Promise(resolve=>release=resolve),loading=new Promise(resolve=>reached=resolve);
+  h.elements.set('#custom-4',input);h.run("modal('Job','',true,false,'jobs:9')");
+  h.context.fetch=async path=>({ok:true,json:async()=>{
+   if(path==='/api/'+endpoint){reached();await gate;}
+   if(path==='/api/custom-fields')return [{id:4,entity_type:'jobs',field_name:'Access'}];
+   if(path==='/api/jobs/9')return {id:9,title:'Job',status:'active'};
+   return [];
+  }});
+  const refresh=h.run("detail('jobs',9,panelVersion)");await loading;
+  // Let all other supplementary requests settle before typing.
+  await new Promise(resolve=>setImmediate(resolve));input.value='Typed during checklist loading';release();await refresh;
+  assert.match(h.elements.get('#overlay').innerHTML,/value="Typed during checklist loading"/);
+ }
+});
+test('Final audit: overlapping loads use the rendered record as the draft owner',async()=>{
+ const h=domHarness(),input={value:'Record A draft'};let release,reached;
+ const gate=new Promise(resolve=>release=resolve),loading=new Promise(resolve=>reached=resolve);
+ h.elements.set('#custom-4',input);h.run("modal('A','',true,false,'jobs:9')");
+ let pending=true;
+ h.context.fetch=async path=>({ok:true,json:async()=>{
+  if(path==='/api/jobs/10'&&pending){pending=false;reached();await gate;}
+  if(/^\/api\/jobs\/\d+$/.test(path))return {id:Number(path.split('/').at(-1)),title:'Job',status:'active'};
+  if(path==='/api/custom-fields')return [{id:4,entity_type:'jobs',field_name:'Access',default_value:'Record B persisted'}];
+  return [];
+ }});
+ const first=h.run("detail('jobs',10)");await loading;
+ assert.equal(h.run('activeDetailKey'),'jobs:9');
+ await h.run("detail('jobs',10)");release();await first;
+ assert.match(h.elements.get('#overlay').innerHTML,/value="Record B persisted"/);assert.doesNotMatch(h.elements.get('#overlay').innerHTML,/Record A draft/);
+ assert.equal(h.run('activeDetailKey'),'jobs:10');h.run("modal('Other','')");assert.equal(h.run('activeDetailKey'),'');
+});
+test('Final audit: equal and lower revisions retain shared guards until both sessions logout',async t=>{
+ const {w,request,reauth,session}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Shared retries',field_key:'shared_retries',field_type:'text'});
+ const save=(rev_scope,revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'jobs',entity_id:1,rev_scope,revision,value_text});
+ const first=session.token;for(const scope of ['equal','lower'])await save(scope,5,'Latest');
+ await reauth();const second=session.token;
+ assert.equal((await save('equal',5,'Replay')).body.value_text,'Latest');assert.equal((await save('lower',4,'Stale')).body.value_text,'Latest');
+ session.token=first;await request('auth/logout','POST',{});session.token=second;
+ for(const scope of ['equal','lower'])assert.equal((await save(scope,3,'Must not overwrite')).body.value_text,'Latest');
+ await request('auth/logout','POST',{});await reauth();
+ for(const scope of ['equal','lower'])assert.equal((await save(scope,1,'Released')).body.value_text,'Released');
+});
+test('Final audit: pre-upgrade transitions without logs get new keys and idempotent retries',t=>{
+ const w=fixture(t);
+ for(const type of ['quotes','jobs'])for(const evidence of ['base','suffix','execution',...(type==='quotes'?['status','notes']:[])]){
+  const event=type==='quotes'?'quote_sent':'job_completed',action=type==='quotes'?'sent':'completed';
+  const row=type==='quotes'?w.createQuote({client_id:1,title:'Pre-upgrade',...(evidence==='status'?{status:'changes_requested'}:evidence==='notes'?{change_request_notes:'Revise'}:{})}):w.createJob({client_id:1,title:'Pre-upgrade'}),base=`${event}:${type}:${row.id}`;
+  const rule=w.r.insert('automations',{name:'Pre-upgrade',trigger_event:event,action_type:'create_task',is_enabled:1});
+  const sub=w.r.insert('webhook_subscriptions',{topic:event,target_url:'https://example.test/hook',secret:'test',active:1,delivered_keys_json:JSON.stringify(evidence==='base'?[base]:evidence==='suffix'?[`${base}:old`]:[])});
+  if(evidence==='execution')w.r.insert('automation_executions',{automation_id:rule.id,trigger_event:event,entity_type:type,entity_id:row.id,idempotency_key:`${rule.id}:${base}`,status:'succeeded',scheduled_for:new Date().toISOString()});
+  if(type==='quotes')w.sendQuote(row.id);else w.completeJob(row.id);
+  const logs=w.r.list('activity_logs',{entity_type:type,entity_id:row.id,action}),key=`${base}:${logs.at(-1).id}`,saved=w.r.get('webhook_subscriptions',sub.id),runs=w.r.list('automation_executions',{entity_type:type,entity_id:row.id});
+  assert.equal(logs.length,2);assert.equal(JSON.parse(saved.last_payload_json).event_key,key);assert.ok(runs.some(run=>run.idempotency_key===`${rule.id}:${key}`));
+  // A migrated record may retain only its latest activity log.
+  w.r.db.prepare('DELETE FROM activity_logs WHERE id=?').run(logs[0].id);
+  emit(w.r,event,type,row.id);emit(w.r,event,type,row.id);
+  assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);assert.deepEqual(w.r.list('automation_executions',{entity_type:type,entity_id:row.id}),runs);
+ }
+});
+
+test('Astra 6 P2: logout preserves other sessions revision scopes, including shared scopes',async t=>{
+ const {w,request,reauth,session}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Session guard',field_key:'session_guard',field_type:'text'}),first=session.token;
+ const save=(rev_scope,revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'jobs',entity_id:1,rev_scope,revision,value_text});
+ await save('shared',1,'first');await save('first-only',2,'first only');
+ await reauth();const second=session.token;
+ await save('shared',3,'shared latest');await save('second-only',3,'second latest');
+ session.token=first;assert.equal((await request('auth/logout','POST',{})).status,200);session.token=second;
+ for(const scope of ['shared','second-only'])assert.equal((await save(scope,2,'stale')).body.value_text,'second latest');
+ assert.equal((await save('first-only',1,'released')).body.value_text,'released');
+ await request('auth/logout','POST',{});await reauth();assert.equal((await save('shared',1,'reset')).body.value_text,'reset');
+});
+test('Astra 6 P2: checklist actions use rendered intent rather than another viewers state',async()=>{
+ for(const [suffix,markup,expected,reads] of [
+  [':1','',true,0],[':0','',false,0],[':false','',false,0],
+  ['', '<button data-action="toggle-checklist-item:4:jobs:9">☐</button>',true,0],
+  ['', '<button data-action="toggle-checklist-item:4:jobs:9">☑</button>',false,0],
+  ['', '<button data-action="toggle-checklist-item:4:jobs:9:0">☐</button>',false,0],
+  ['', '',false,1]
+ ]){
+  const h=domHarness();h.run('detail=async()=>{}');h.elements.get('#overlay').innerHTML=markup;
+  h.context.fetch=async(path,options)=>{h.calls.push({path,options});return {ok:true,json:async()=>({is_completed:1})};};
+  await h.run(`gapAction('toggle-checklist-item:4:jobs:9${suffix}')`);
+  assert.equal(h.calls.filter(c=>c.options.method==='GET').length,reads);
+  assert.equal(JSON.parse(h.calls.find(c=>c.options.method==='POST').options.body).completed,expected);
+ }
+});
+test('Astra 6 P2: drawer refreshes preserve drafts without leaking to other entities or reopened drawers',async()=>{
+ const h=domHarness(),input={value:'Unsaved draft'};
+ h.context.fetch=async(path,options)=>{h.calls.push({path,options});return {ok:true,json:async()=>path==='/api/custom-fields'?[{id:4,entity_type:'jobs',field_name:'Access',field_type:'text',default_value:'Default'}]:path==='/api/custom-field-values'?[{field_definition_id:4,entity_type:'jobs',entity_id:9,value_text:'Saved'}]:path==='/api/checklists'?[{id:2,job_id:9,title:'Work'}]:path==='/api/checklist-items'?[{id:4,checklist_id:2,label:'Done',is_completed:0}]:/^\/api\/jobs\/\d+$/.test(path)?{id:Number(path.split('/').at(-1)),title:'Job',status:'active'}:[]};};
+ await h.run("detail('jobs',9)");assert.match(h.elements.get('#overlay').innerHTML,/value="Saved"/);assert.match(h.elements.get('#overlay').innerHTML,/toggle-checklist-item:4:jobs:9:1/);
+ h.elements.set('#custom-4',input);
+ for(const action of ['remove-entity-tag:1:jobs:9','toggle-checklist-item:4:jobs:9:1']){await h.run(`gapAction('${action}')`);assert.match(h.elements.get('#overlay').innerHTML,/value="Unsaved draft"/);}
+ input.value='';await h.run("detail('jobs',9)");assert.match(h.elements.get('#overlay').innerHTML,/id="custom-4" value=""/);
+ input.value='Do not leak';await h.run("detail('jobs',10)");assert.match(h.elements.get('#overlay').innerHTML,/value="Default"/);assert.doesNotMatch(h.elements.get('#overlay').innerHTML,/Do not leak/);
+ await h.run("close();detail('jobs',9)");assert.match(h.elements.get('#overlay').innerHTML,/value="Saved"/);
+});
+test('Astra 6 P3: webhook URL aliases reject nonstrings and blanks atomically and trim valid URLs',async t=>{
+ const {request,w}=await httpFixture(t);
+ for(const key of ['target_url','webhook_url','url']){
+  const created=await request('webhooks','POST',{topic:'*',[key]:'  https://example.test/hook  '});assert.equal(created.status,201);assert.equal(created.body.target_url,'https://example.test/hook');
+  const before=w.r.get('webhook_subscriptions',created.body.id),count=w.r.list('webhook_subscriptions').length;
+  for(const value of [['https://example.test/hook'],{},null,42,true,'','   ','ftp://example.test/hook']){
+   const data={topic:'*',[key]:value};assert.equal((await request('webhooks','POST',data)).status,400);
+   assert.equal((await request('webhooks/'+created.body.id,'PATCH',data)).status,400);
+   assert.deepEqual(w.r.get('webhook_subscriptions',created.body.id),before);assert.equal(w.r.list('webhook_subscriptions').length,count);
+  }
+ }
+ assert.equal((await request('webhooks','POST',{topic:'*',target_url:'https://example.test/valid',url:['https://example.test/invalid']})).status,400);
+});
+
+test('Astra 6 P2: clearing an existing job line name preserves both charges',async t=>{
+ const {request}=await httpFixture(t),created=await request('jobs','POST',{client_id:1,title:'Two-line job',items:[{name:'Labor',quantity:1,unit_price_cents:10000},{name:'Materials',quantity:1,unit_price_cents:20000}]});
+ assert.equal(created.status,201);
+ const before=(await request('jobs/'+created.body.id)).body;assert.equal(before.total_cents,30000);assert.equal(before.items.length,2);
+ const h=domHarness();h.context.doc=before;h.run("render=async()=>{};fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>path==='/api/jobs/'+doc.id&&!options.body?doc:[]};}");
+ await h.run(`builder('jobs',${before.id})`);
+ const lines=before.items.map(line=>{const inputs={'[data-name]':{value:line.name},'[data-qty]':{value:String(line.quantity)},'[data-price]':{value:String(line.unit_price_cents/100)}};return {dataset:{line:JSON.stringify(line)},querySelector:s=>inputs[s]};});
+ h.context.document.querySelectorAll=s=>s==='.line-item'?lines:[];
+ lines[0].querySelector('[data-name]').value='';
+ await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{title:before.title,value:'300',tax_rate:String(before.tax_rate),discount_type:before.discount_type,discount_value:String(before.discount_value)}}});
+ const sent=JSON.parse(h.calls.find(c=>c.options.method==='PATCH').options.body),saved=await request('jobs/'+before.id,'PATCH',sent);assert.equal(saved.status,200);
+ const after=(await request('jobs/'+before.id)).body;
+ assert.deepEqual(after.items.map(line=>[line.name,line.quantity,line.unit_price_cents]),[['Labor',1,10000],['Materials',1,20000]]);
+ assert.equal(after.subtotal_cents,30000);assert.equal(after.total_cents,30000);
+});
+
+test('Astra 6 P2: unnamed priced jobs retain value through pricing edits',async t=>{
+ const {w,request}=await httpFixture(t),seeded=(await request('jobs/5')).body;
+ assert.equal(seeded.title,'');assert.equal(seeded.total_cents,12220000);assert.equal(seeded.items[0].name,'Job');
+ const taxed=await submitJobBuilder(request,seeded,{tax_rate:'10'});assert.equal(taxed.job.subtotal_cents,12220000);assert.equal(taxed.job.tax_cents,1222000);
+ const discounted=await submitJobBuilder(request,taxed.job,{discount_value:'10'});assert.equal(discounted.job.total_cents,12097800);
+ for(const title of ['', '   ']){
+  const created=w.createJob({client_id:1,title,subtotal_cents:10000,total_cents:10000});w.r.insert('preferences',{name:`job_lines:${created.id}`,value_json:JSON.stringify([{name:'   ',quantity:1,unit_price_cents:10000,taxable:1}])});
+  const before=(await request('jobs/'+created.id)).body;assert.equal(before.items[0].name,'Job');
+  const legacy={...before,items:before.items.map(l=>({...l,name:'   '}))};const edited=await submitJobBuilder(request,legacy,{tax_rate:'10'});assert.equal(edited.sent.items[0].name,'Job');assert.equal(edited.job.total_cents,11000);
+ }
+ const fallback=w.createJob({client_id:1,title:' ',subtotal_cents:10000,total_cents:20000});assert.equal((await request('jobs/'+fallback.id)).body.items[0].name,'Job');
+});
+test('Astra 6 P2: legacy repeat logs retry base keys but new transitions get fresh keys',t=>{
+ const w=fixture(t);
+ for(const type of ['quotes','jobs'])for(const mode of ['webhook','automation','both']){
+  const event=type==='quotes'?'quote_sent':'job_completed',action=type==='quotes'?'sent':'completed',row=type==='quotes'?w.createQuote({client_id:1,title:'Legacy retry'}):w.createJob({client_id:1,title:'Legacy retry'}),base=`${event}:${type}:${row.id}`;
+  const sub=mode!=='automation'?w.r.insert('webhook_subscriptions',{topic:event,target_url:'https://example.test/hook',secret:'test',active:1}):null;
+  const rule=mode!=='webhook'?w.r.insert('automations',{name:'Legacy retry',trigger_event:event,action_type:'create_task',is_enabled:1}):null;
+  emit(w.r,event,type,row.id,base);
+  for(let i=0;i<2;i++)w.r.insert('activity_logs',{entity_type:type,entity_id:row.id,action,summary:'Legacy transition'});
+  const count=()=>[sub?w.r.get('webhook_subscriptions',sub.id).delivery_count:0,w.r.list('automation_executions',{entity_type:type,entity_id:row.id,trigger_event:event}).length];const before=count();
+  emit(w.r,event,type,row.id);emit(w.r,event,type,row.id);assert.deepEqual(count(),before);
+  if(type==='quotes')w.sendQuote(row.id);else w.completeJob(row.id);
+  const after=count();if(sub)assert.equal(after[0],before[0]+1);if(rule)assert.ok(after[1]>before[1]);
+  const latest=w.r.list('activity_logs',{entity_type:type,entity_id:row.id,action}).at(-1),key=`${base}:${latest.id}`;
+  if(sub)assert.ok(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json).includes(key));
+  if(rule)assert.ok(w.r.list('automation_executions',{automation_id:rule.id}).some(e=>e.idempotency_key===`${rule.id}:${key}`));
+  emit(w.r,event,type,row.id);emit(w.r,event,type,row.id,base);assert.deepEqual(count(),after);
+ }
+});
+test('Astra 6 P2: revision scopes and fields evict oldest entries and logout clears owned state',async t=>{
+ const {w,request,reauth}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Bounded',field_key:'bounded',field_type:'text'});
+ const save=(entity_id,rev_scope,revision,value_text)=>request('custom-field-values','POST',{field_definition_id:field.id,entity_type:'jobs',entity_id,rev_scope,revision,value_text});
+ for(let i=0;i<8;i++)assert.ok((await save(1,'scope'+i,2,'initial')).status<300);
+ await save(1,'scope0',3,'refreshed');await save(1,'scope8',2,'new scope');
+ assert.equal((await save(1,'scope0',2,'stale')).body.value_text,'new scope');
+ assert.equal((await save(1,'scope1',1,'evicted scope')).body.value_text,'evicted scope');
+ for(let i=2;i<=256;i++)await save(i,'page',2,'initial');
+ await save(1,'scope0',4,'refreshed field');await save(257,'page',2,'new field');
+ assert.equal((await save(1,'scope0',3,'stale')).body.value_text,'refreshed field');
+ assert.equal((await save(2,'page',1,'evicted field')).body.value_text,'evicted field');
+ assert.equal((await request('auth/logout','POST',{})).status,200);
+ await reauth();
+ const reset=await save(1,'scope0',1,'after logout');assert.ok(reset.status<300,JSON.stringify(reset.body));assert.equal(reset.body.value_text,'after logout');
+});
+
+test('Gap controls: preferences and job line items round trip over HTTP',async t=>{
+ const {request}=await httpFixture(t);
+ const initial=(await request('account-billing')).body;assert.equal(initial.plan,'Plus Monthly');assert.equal(initial.price_cents,59900);
+ for(const plan of ['Core','Grow'])assert.ok((await request('preferences','POST',{name:'account-plan',value_json:{plan,price_cents:19900,addons:['AI Receptionist']}})).status<300);
+ const billing=(await request('account-billing')).body;assert.equal(billing.plan,'Grow');assert.deepEqual(billing.addons,['AI Receptionist']);assert.equal(billing.card_last4,'1821');
+ assert.equal((await request('preferences')).body.filter(p=>p.name==='account-plan').length,1);
+ const created=await request('jobs','POST',{client_id:1,title:'Line builder',items:[{name:'Service',quantity:2,unit_price_cents:1000,taxable:1}],tax_rate:10,discount_type:'fixed',discount_value:100});assert.equal(created.status,201,JSON.stringify(created.body));
+ const job=(await request('jobs/'+created.body.id)).body;assert.equal(job.items[0].name,'Service');assert.equal(job.tax_rate,10);assert.equal(job.discount_value,100);assert.equal(job.total_cents,2090);
+});
+test('Gap controls: rich modals and schedule selectors dispatch without navigation',async()=>{
+ const h=domHarness();h.run('render=async()=>{}');
+ await h.click({action:'updates'});assert.match(h.elements.get('#overlay').innerHTML,/Product Updates &amp; Release Notes/);assert.match(h.elements.get('#overlay').innerHTML,/mark-updates-read/);
+ await h.click({action:'language'});assert.match(h.elements.get('#overlay').innerHTML,/Français/);
+ await h.click({action:'set-sched-filter:status:completed'});assert.equal(h.run('schedFilter.status'),'completed');
+ await h.click({action:'set-tag-filter:3'});assert.equal(h.run('clientTagFilter'),'3');
+ await h.run("builder('jobs')");assert.match(h.elements.get('#overlay').innerHTML,/Products & services/);assert.match(h.elements.get('#overlay').innerHTML,/name="billing_type"/);
+ for(const action of ['remove-entity-tag','save-custom-field','toggle-checklist-item','add-attachment'])assert.ok(appSource.includes(action+':'));
+});
+
+test('Astra 6 audit: browser initialization bootstraps with POST and stores its token',async()=>{
+ const h=domHarness();h.context.location.pathname='/';const stored=[];h.context.sessionStorage.setItem=(...args)=>stored.push(args);h.run('shell=()=>{};render=async()=>{}');
+ h.context.fetch=async(path,options)=>{h.calls.push({path,options});return {ok:true,json:async()=>path==='/api/auth/bootstrap'?{token:'fresh-browser-token'}:path==='/api/auth/me'?{user:{id:1}}:path==='/api/auth/workspace'?{organization:{id:1},team:[]}:[]};};
+ await h.run('init()');const call=h.calls.find(c=>c.path==='/api/auth/bootstrap');assert.equal(call.options.method,'POST');assert.equal(call.options.body,'{}');assert.deepEqual(stored,[['token','fresh-browser-token']]);
+});
+test('Astra 6 audit: detail drawers tolerate forbidden supplementary endpoints',async()=>{
+ for(const type of ['clients','requests','quotes','invoices','jobs']){
+  const h=domHarness();h.context.fetch=async(path)=>({ok:path===`/api/${type}/7`||path==='/api/clients/7/timeline',status:403,json:async()=>path===`/api/${type}/7`?{id:7,title:'Visible detail',display_name:'Visible detail',status:'active'}:path.endsWith('/timeline')?{}:{error:'Permission denied'}});
+  await h.run(`detail('${type}',7)`);assert.match(h.elements.get('#overlay').innerHTML,/Visible detail/);assert.match(h.elements.get('#overlay').innerHTML,/Attachments/);
+ }
+});
+test('Astra 6 audit: settings and preference modals survive forbidden preferences',async()=>{
+ const h=domHarness();h.context.document.body={classList:{contains:()=>false}};h.run("user={name:'Employee'};org={email:'employee@example.test'}");
+ h.context.fetch=async(path)=>({ok:path!=='/api/preferences',status:path==='/api/preferences'?403:200,json:async()=>path==='/api/preferences'?{error:'Permission denied'}:[]});
+ await h.run("globalPanel('settings')");assert.match(h.elements.get('#overlay').innerHTML,/Dark Mode/);assert.match(h.elements.get('#overlay').innerHTML,/data-action="logout"/);
+ for(const [action,text] of [['updates',/Release Notes/],['language',/Français/],['rewards',/Bonus Entries/]]){await h.run(`gapAction('${action}')`);assert.match(h.elements.get('#overlay').innerHTML,text);}
+ await h.run("savePreference('workspace-language',{language:'Français'})");assert.match(h.elements.get('#toast').textContent,/cannot save/);
+ h.context.fetch=async()=>({ok:false,status:500,json:async()=>({error:'Server failed'})});await assert.rejects(h.run("savePreference('workspace-language',{})"),/Server failed/);
+});
+test('Astra 6 audit: empty job editor sends items array only when editing',async t=>{
+ const {request}=await httpFixture(t),created=await request('jobs','POST',{client_id:1,title:'Clear lines',items:[{name:'Work',quantity:1,unit_price_cents:10000}]});
+ const h=domHarness();h.context.doc=(await request('jobs/'+created.body.id)).body;h.run("render=async()=>{};fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>path==='/api/jobs/'+doc.id&&!options.body?doc:[]};}");
+ for(const edit of [true,false]){await h.run(edit?`builder('jobs',${created.body.id})`:"builder('jobs')");h.calls.length=0;await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{title:'Clear lines',client_id:'1',value:'100'}}});const sent=JSON.parse(h.calls.find(c=>c.options.method===(edit?'PATCH':'POST')).options.body);
+  if(edit){assert.deepEqual(sent.items,[]);assert.ok(!('total_cents' in sent));assert.equal((await request('jobs/'+created.body.id,'PATCH',sent)).status,200);const job=(await request('jobs/'+created.body.id)).body;assert.deepEqual(job.items,[]);assert.equal(job.total_cents,0);assert.equal(job.tax_cents,0);}else{assert.ok(!('items' in sent));assert.equal(sent.total_cents,10000);}
+ }
+});
+
+test('Astra 6 regression: overlapping custom field clicks POST their click-time values without a GET',async()=>{
+ const h=domHarness(),input={value:'First click'},pendingResponses=[];h.elements.set('#custom-4',input);
+ h.context.fetch=(path,options)=>{h.calls.push({path,options});return new Promise(resolve=>pendingResponses.push(resolve));};
+ const first=h.run("gapAction('save-custom-field:4:jobs:9')");input.value='Second click';
+ const second=h.run("gapAction('save-custom-field:4:jobs:9')");h.elements.delete('#custom-4');
+ assert.equal(h.calls.length,2);assert.deepEqual(h.calls.map(c=>JSON.parse(c.options.body).value_text),['First click','Second click']);assert.deepEqual(h.calls.map(c=>JSON.parse(c.options.body).revision),[1,2]);
+ const scope=JSON.parse(h.calls[0].options.body).rev_scope;assert.ok(scope);assert.equal(JSON.parse(h.calls[1].options.body).rev_scope,scope);assert.notEqual(domHarness().run('customFieldScope'),scope);
+ for(const call of h.calls){assert.equal(call.path,'/api/custom-field-values');assert.equal(call.options.method,'POST');}
+ for(const resolve of pendingResponses.reverse())resolve({ok:true,json:async()=>({})});await Promise.all([first,second]);
+});
+test('Astra 6 regression: job line rendering preserves required text and optional names',async()=>{
+ const h=domHarness(),line={name:'Work',description:'Permit required before work',quantity:1,unit_price_cents:10000};h.context.doc={id:9,title:'Permit',items:[line]};
+ h.run("fetch=async()=>({ok:true,json:async()=>doc});render=async()=>{}");
+ for(const type of ['jobs','quotes','invoices']){
+  await h.run(`builder('${type}',9)`);const html=h.elements.get('#overlay').innerHTML;
+  const metadata=html.match(/data-line="([^"]*)"/)[1].replaceAll('&quot;','"').replaceAll('&amp;','&');assert.deepEqual(JSON.parse(metadata),line);
+  const input=html.match(/<input data-name[^>]*>/)[0];assert.equal(/ required(?:>|\s)/.test(input),type!=='jobs');
+  if(type==='jobs')h.elements.set('#builder [name="job_type"]',{});else h.elements.delete('#builder [name="job_type"]');
+  let added;h.elements.set('#items',{insertAdjacentHTML:(position,html)=>{added=html;}});
+  const target={dataset:{},hasAttribute:name=>name==='data-add-line'};
+  await h.listeners.click({target:{closest:s=>s==='button,a,[data-slot],tr[data-id]'?target:null,matches:()=>false}});
+  assert.equal(/ required(?:>|\s)/.test(added),type!=='jobs');
+ }
+});
+async function submitJobBuilder(request,job,values,items=job.items){
+ const h=domHarness();h.context.doc=job;h.run("render=async()=>{};fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>path==='/api/jobs/'+doc.id&&!options.body?doc:[]};}");
+ await h.run(`builder('jobs',${job.id})`);
+ h.context.document.querySelectorAll=()=>items.map(line=>({dataset:{line:JSON.stringify(line)},querySelector:s=>({value:s==='[data-name]'?line.name:s==='[data-qty]'?String(line.quantity):String(line.unit_price_cents/100)})}));
+ await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{title:job.title,value:String(job.total_cents/100),tax_rate:String(job.tax_rate),discount_type:job.discount_type,discount_value:String(job.discount_type==='fixed'?job.discount_value/100:job.discount_value),...values}}});
+ const sent=JSON.parse(h.calls.find(c=>c.options.method==='PATCH').options.body),saved=await request('jobs/'+job.id,'PATCH',sent);assert.equal(saved.status,200,JSON.stringify(saved.body));return {sent,job:(await request('jobs/'+job.id)).body};
+}
+test('Astra 6 regression: legacy 7.125 percent job survives unchanged builder round trip',async t=>{
+ const {w,request}=await httpFixture(t),legacy=w.createJob({client_id:1,title:'Legacy precision',subtotal_cents:100000,tax_cents:7125,total_cents:107125});
+ const before=(await request('jobs/'+legacy.id)).body;assert.equal(before.tax_rate,7.125);
+ const {job}=await submitJobBuilder(request,before,{});assert.deepEqual([job.subtotal_cents,job.tax_cents,job.total_cents],[100000,7125,107125]);assert.equal(job.tax_rate,7.125);
+});
+test('Astra 6 regression: manual job value edits override unchanged lines but not edited lines',async t=>{
+ const {w,request}=await httpFixture(t);
+ for(const empty of [false,true]){
+  const manual=w.createJob({client_id:1,title:'Manual job',total_cents:10000}),before=(await request('jobs/'+manual.id)).body;
+  const {sent,job}=await submitJobBuilder(request,before,{value:'250'},empty?[]:before.items);assert.ok(!('total_cents' in sent));assert.equal(sent.items.length,1);assert.equal(sent.items[0].unit_price_cents,25000);assert.equal(sent.items[0].taxable,1);assert.equal(sent.tax_rate,0);assert.equal(sent.discount_value,0);assert.equal(job.total_cents,25000);
+  const taxed=await submitJobBuilder(request,job,{tax_rate:'10'});assert.equal(taxed.job.tax_cents,2500);assert.equal(taxed.job.total_cents,27500);
+  const edited=await submitJobBuilder(request,job,{value:'300'},[{...job.items[0],unit_price_cents:40000}]);assert.equal(edited.job.total_cents,40000);
+ }
+});
+test('Astra 6 regression: 1001 overdue invoices are delivered only once across unchanged scans',t=>{
+ const w=fixture(t);w.r.db.exec("UPDATE invoices SET status='void'");
+ for(let i=0;i<1001;i++)w.r.insert('invoices',{client_id:1,subject:'Overdue '+i,status:'awaiting_payment',due_date:'2000-01-01',total_cents:100,balance_due_cents:100});
+ const sub=w.r.insert('webhook_subscriptions',{topic:'invoice_overdue',target_url:'https://example.test/webhook',secret:'test',active:1});
+ assert.equal(w.overdue().length,1001);const first=w.r.get('webhook_subscriptions',sub.id);assert.equal(first.delivery_count,1001);assert.equal(JSON.parse(first.delivered_keys_json).length,1001);
+ assert.equal(w.overdue().length,1001);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),first);
+});
+test('Astra 6 regression: webhook keys prune expired windows only and tolerate malformed JSON',t=>{
+ const w=fixture(t),now=new Date('2035-01-02T12:00:00.000Z'),sub=w.r.insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/webhook',secret:'test',active:1});
+ const keep=['client_created:clients:1','overdue:2:2035-01-02',...Array.from({length:1001},(_,i)=>`reminder:${i}:2035-01-03T12:00:00.000Z`)];
+ const initial=w.r.update('webhook_subscriptions',sub.id,{delivered_keys_json:JSON.stringify([...keep,'overdue:1:2035-01-01','reminder:1:2035-01-02T11:00:00.000Z','reminder:2:2035-01-02T12:00:00.000Z'])});
+ const saved=deliverWebhook(w.r,initial,{},now,'new:event');assert.deepEqual(JSON.parse(saved.delivered_keys_json),[...keep,'new:event']);
+ for(const key of keep.filter(k=>k.startsWith('reminder:')))emit(w.r,'visit_approaching','clients',1,key,now);
+ assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,1);
+ for(const raw of ['{}','null']){w.r.update('webhook_subscriptions',sub.id,{delivered_keys_json:raw});emit(w.r,'client_created','clients',1,'safe:event',now);assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),['safe:event']);}
+ deliverWebhook(w.r,{...w.r.get('webhook_subscriptions',sub.id),delivered_keys_json:'{broken'},{},now,'safe:event');assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),['safe:event']);
+});
+
+test('Astra 6 regression: partial job options preserve default percent discounts on unchanged saves',async t=>{
+ const {request}=await httpFixture(t);
+ const created=await request('jobs','POST',{client_id:1,title:'Default discount',total_cents:10000,discount_value:10});assert.equal(created.status,201);
+ const before=(await request('jobs/'+created.body.id)).body;
+ assert.equal(before.discount_type,'percent');assert.equal(before.discount_value,10);assert.equal(before.tax_rate,0);
+ const {job}=await submitJobBuilder(request,before,{});assert.equal(job.total_cents,before.total_cents);assert.equal(job.discount_value,10);
+});
+test('Astra 6 regression: fully discounted manual jobs retain taxable fallback lines',async t=>{
+ const {request}=await httpFixture(t);
+ const created=await request('jobs','POST',{client_id:1,title:'Fully discounted',total_cents:10000,tax_rate:10,discount_type:'percent',discount_value:100});assert.equal(created.status,201);
+ const before=(await request('jobs/'+created.body.id)).body;assert.equal(before.total_cents,0);assert.equal(before.items[0].taxable,1);
+ const {job}=await submitJobBuilder(request,before,{discount_value:'50'});assert.equal(job.subtotal_cents,10000);assert.equal(job.tax_cents,500);assert.equal(job.total_cents,5500);
+});
+test('Astra 6 regression: manual value override selects an optional unselected first line',async t=>{
+ const {request}=await httpFixture(t);
+ const created=await request('jobs','POST',{client_id:1,title:'Optional first',items:[{name:'Optional',quantity:1,unit_price_cents:10000,is_optional:1,is_selected:0}]});assert.equal(created.status,201);
+ const before=(await request('jobs/'+created.body.id)).body;
+ const {sent,job}=await submitJobBuilder(request,before,{value:'250'});assert.equal(sent.items[0].is_optional,0);assert.equal(sent.items[0].is_selected,1);assert.equal(job.total_cents,25000);
+});
+test('Astra 6 regression: job builder persists client changes but other documents omit them',async t=>{
+ const {w,request}=await httpFixture(t),client=w.createClient({display_name:'Replacement client'}),created=w.createJob({client_id:1,title:'Reassign',total_cents:10000});
+ const before=(await request('jobs/'+created.id)).body,{sent,job}=await submitJobBuilder(request,before,{client_id:String(client.id)});assert.equal(sent.client_id,client.id);assert.equal(job.client_id,client.id);
+ for(const type of ['quotes','invoices']){const h=domHarness();h.run('render=async()=>{}');await h.run(`builder('${type}',9)`);await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{client_id:String(client.id)}}});const patch=h.calls.find(c=>c.options.method==='PATCH');assert.ok(!('client_id' in JSON.parse(patch.options.body)));}
+});
+test('Astra 6 regression: custom field POST aliases reconcile legacy duplicates and displayed values',async t=>{
+ const {request,w}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Access',field_key:'access',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ const results=await Promise.all(['custom-field-values','custom-values'].map((path,i)=>request(path,'POST',{...data,value_text:'Value '+i})));for(const result of results)assert.ok(result.status<300,JSON.stringify(result.body));assert.equal(results[0].body.id,results[1].body.id);
+ const h=domHarness();h.context.defs=[field];h.run("fetch=async(path)=>({ok:true,json:async()=>path==='/api/custom-fields'?defs:path==='/api/custom-field-values'?values:[]})");
+ for(const path of ['custom-values','custom-field-values']){
+  w.r.insert('custom_field_values',{...data,value_text:'Legacy duplicate'});h.context.values=w.r.list('custom_field_values',data);
+  const before=await h.run("entitySections('jobs',1)");assert.ok(before.includes(`value="${h.context.values[0].value_text}"`));assert.doesNotMatch(before,/value="Legacy duplicate"/);
+  const latest=await request(path,'POST',{...data,value_text:'Latest'});assert.equal(latest.status,200);assert.equal(latest.body.id,results[0].body.id);
+  const values=w.r.list('custom_field_values',data);assert.equal(values.length,1);assert.equal(values[0].value_text,'Latest');assert.equal(values.at(-1).value_text,'Latest');h.context.values=values;
+  const html=await h.run("entitySections('jobs',1)");assert.match(html,/value="Latest"/);assert.doesNotMatch(html,/value="Legacy duplicate"/);
+ }
+});
+test('Astra 6 regression: quote resends deliver new webhooks and preserve every retry key',t=>{
+ const w=fixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/webhook',secret:'test',active:1}),q=w.createQuote({client_id:1,title:'Resend'},[{name:'Work',quantity:1,unit_price_cents:1000}]);
+ const other='quote_sent:quotes:99999:1';w.r.update('webhook_subscriptions',sub.id,{delivered_keys_json:JSON.stringify([other,'client_created:clients:1'])});
+ let previous,firstKey;
+ for(let i=1;i<=3;i++){if(i>1)w.requestChanges(q.id,'Please revise');w.sendQuote(q.id);const saved=w.r.get('webhook_subscriptions',sub.id),keys=JSON.parse(saved.delivered_keys_json),key=JSON.parse(saved.last_payload_json).event_key;assert.equal(saved.delivery_count,i);assert.notEqual(key,previous);assert.equal(keys.filter(k=>k===`quote_sent:quotes:${q.id}`||k.startsWith(`quote_sent:quotes:${q.id}:`)).length,i);firstKey??=key;emit(w.r,'quote_sent','quotes',q.id,firstKey);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);assert.ok(keys.includes(other));assert.ok(keys.includes('client_created:clients:1'));emit(w.r,'quote_sent','quotes',q.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);previous=key;}
+});
+
+test('Astra 6 regression: unchanged pricing omits pricing fields and preserves manually repriced jobs',async t=>{
+ const {w,request}=await httpFixture(t);
+ const legacy=w.createJob({client_id:1,title:'Repriced',subtotal_cents:10000,tax_cents:825,total_cents:12000});
+ const before=(await request('jobs/'+legacy.id)).body;assert.equal(before.items.length,1);assert.equal(before.items[0].unit_price_cents,12000);assert.equal(before.items[0].taxable,0);assert.equal(before.tax_rate,0);assert.equal(before.discount_value,0);
+ const {sent,job}=await submitJobBuilder(request,before,{title:'Notes-only edit'});
+ for(const key of ['items','total_cents','tax_rate','discount_type','discount_value'])assert.ok(!(key in sent),key);
+ assert.equal(job.title,'Notes-only edit');assert.deepEqual([job.subtotal_cents,job.tax_cents,job.total_cents],[10000,825,12000]);
+ const created=await request('jobs','POST',{client_id:1,title:'Fixed discount',items:[{name:'Work',quantity:1,unit_price_cents:10000,taxable:1}],tax_rate:10,discount_type:'fixed',discount_value:1000});assert.equal(created.status,201);
+ const fixed=(await request('jobs/'+created.body.id)).body,unchanged=await submitJobBuilder(request,fixed,{});
+ for(const key of ['items','total_cents','tax_rate','discount_type','discount_value'])assert.ok(!(key in unchanged.sent),key);
+ const override=await submitJobBuilder(request,fixed,{value:'250'});assert.equal(override.sent.discount_type,'percent');assert.equal(override.sent.discount_value,0);assert.equal(override.sent.tax_rate,0);assert.equal(override.job.total_cents,25000);
+ for(const values of [{tax_rate:'20'},{discount_type:'percent'},{discount_value:'20'}]){const changed=await submitJobBuilder(request,fixed,values);assert.ok('items' in changed.sent);assert.ok('tax_rate' in changed.sent);assert.ok('discount_type' in changed.sent);assert.ok('discount_value' in changed.sent);}
+});
+test('Astra 6 regression: mixed taxable and exempt legacy job lines infer tax after discount',async t=>{
+ const {w,request}=await httpFixture(t);
+ for(const discount of [0,2000]){
+  const tax=discount?900:1000,legacy=w.createJob({client_id:1,title:'Mixed legacy',subtotal_cents:20000,tax_cents:tax,total_cents:20000-discount+tax});
+  w.r.insert('preferences',{name:`job_lines:${legacy.id}`,value_json:JSON.stringify([{name:'Taxable',quantity:1,unit_price_cents:10000,taxable:1},{name:'Exempt',quantity:1,unit_price_cents:10000,taxable:0},{name:'Unselected',quantity:1,unit_price_cents:5000,taxable:1,is_optional:1,is_selected:0}])});
+  const before=(await request('jobs/'+legacy.id)).body;assert.equal(before.tax_rate,10);assert.equal(before.discount_value,discount);assert.equal(before.items.length,3);
+  const {job}=await submitJobBuilder(request,before,{});assert.equal(job.total_cents,legacy.total_cents);
+  const saved=await request('jobs/'+legacy.id,'PATCH',{items:before.items,tax_rate:before.tax_rate,discount_type:before.discount_type,discount_value:before.discount_value});assert.equal(saved.status,200);assert.equal(saved.body.total_cents,legacy.total_cents);
+ }
+});
+test('Astra 6 regression: sending another quote cannot change retry webhook or automation keys',t=>{
+ const w=fixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/webhook',secret:'test',active:1});
+ const rule=w.r.insert('automations',{name:'Quote retry regression',trigger_event:'quote_sent',action_type:'send_email',action_config_json:'{}',is_enabled:1});
+ for(const legacy of [false,true]){
+  const quotes=['A','B'].map(title=>w.createQuote({client_id:1,title,client_message:legacy?'':'Identical message'},[{name:'Work',quantity:1,unit_price_cents:1000}]));
+  w.sendQuote(quotes[0].id);
+  const msg=w.r.list('messages',{subject:'Your quote'}).at(-1);assert.equal(msg.related_entity_type,'quotes');assert.equal(msg.related_entity_id,quotes[0].id);
+  if(legacy)w.r.update('messages',msg.id,{related_entity_type:null,related_entity_id:null});
+  w.sendQuote(quotes[1].id);
+  const before=w.r.get('webhook_subscriptions',sub.id),executions=w.r.list('automation_executions',{automation_id:rule.id});
+  emit(w.r,'quote_sent','quotes',quotes[0].id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),before);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),executions);
+  w.requestChanges(quotes[0].id,'Resend');w.sendQuote(quotes[0].id);assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,before.delivery_count+1);assert.equal(w.r.list('automation_executions',{automation_id:rule.id}).length,executions.length+1);
+ }
+});
+
+test('Astra 6 regression: title-only job edits preserve multiline instructions',async t=>{
+ const {w,request}=await httpFixture(t),instructions='Unlock side gate\n\nProtect the floor\nLock up when finished',created=w.createJob({client_id:1,title:'Before edit',instructions});
+ const h=domHarness();h.context.doc=(await request('jobs/'+created.id)).body;h.run("render=async()=>{};fetch=async(path,options)=>{calls.push({path,options});return {ok:true,json:async()=>path==='/api/jobs/'+doc.id&&!options.body?doc:[]};}");
+ await h.run(`builder('jobs',${created.id})`);
+ const textarea=h.elements.get('#overlay').innerHTML.match(/<textarea name="instructions">([\s\S]*?)<\/textarea>/);assert.ok(textarea,'Instructions must render as a textarea');assert.equal(textarea[1],instructions);
+ await h.elements.get('#builder').onsubmit({preventDefault(){},target:{values:{title:'After edit',instructions:textarea[1]}}});
+ const sent=JSON.parse(h.calls.find(c=>c.options.method==='PATCH').options.body);assert.equal(sent.instructions,instructions);assert.equal((await request('jobs/'+created.id,'PATCH',sent)).status,200);
+ const saved=(await request('jobs/'+created.id)).body;assert.equal(saved.title,'After edit');assert.equal(saved.instructions,instructions);
+});
+test('Astra 6 regression: string and numeric quote retry IDs share executions and webhook keys',async t=>{
+ const {w,request}=await httpFixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/webhook',secret:'test',active:1}),rule=w.r.insert('automations',{name:'Canonical quote ID',trigger_event:'quote_sent',action_type:'send_email',action_config_json:'{}',is_enabled:1});
+ const q=w.createQuote({client_id:1,title:'Canonical retry'},[{name:'Work',quantity:1,unit_price_cents:1000}]);
+ for(const resend of [false,true]){
+  if(resend)w.requestChanges(q.id,'Revise');w.sendQuote(q.id);
+  const before=w.r.get('webhook_subscriptions',sub.id),executions=w.r.list('automation_executions',{automation_id:rule.id});assert.equal(before.delivery_count,resend?2:1);assert.equal(executions.length,resend?2:1);
+  for(const entity_id of [String(q.id),q.id]){const response=await request('automations/run','POST',{event:'quote_sent',entity_type:'quotes',entity_id});assert.equal(response.status,200);assert.equal(response.body.find(e=>e.automation_id===rule.id).entity_id,q.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),before);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),executions);}
+ }
+});
+test('Astra 6 regression: historical base quote keys remain idempotent across resends',t=>{
+ const w=fixture(t),rule=w.r.insert('automations',{name:'Historical quote',trigger_event:'quote_sent',action_type:'send_email',action_config_json:'{}',is_enabled:1});
+ const historical=w.createQuote({client_id:1,title:'Historical'},[{name:'Work',quantity:1,unit_price_cents:1000}]),key=`quote_sent:quotes:${historical.id}`;
+ w.r.update('quotes',historical.id,{status:'awaiting_response'});
+ w.r.insert('activity_logs',{entity_type:'quotes',entity_id:historical.id,action:'sent',summary:'Historical send'});
+ w.r.insert('messages',{client_id:historical.client_id,channel:'email',direction:'outbound',subject:'Your quote',body:`Quote ${historical.id}: ${historical.title}`,status:'test_mode'});
+ const execution=w.r.insert('automation_executions',{automation_id:rule.id,trigger_event:'quote_sent',entity_type:'quotes',entity_id:historical.id,idempotency_key:`${rule.id}:${key}`,status:'succeeded',scheduled_for:new Date().toISOString()});
+ const sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/webhook',secret:'test',active:1,delivery_count:1,delivered_keys_json:JSON.stringify([key])});
+ for(let i=0;i<2;i++){emit(w.r,'quote_sent','quotes',historical.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),sub);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),[execution]);}
+ w.requestChanges(historical.id,'Please revise');w.sendQuote(historical.id);
+ const saved=w.r.get('webhook_subscriptions',sub.id),sentLog=w.r.list('activity_logs',{entity_type:'quotes',entity_id:historical.id,action:'sent'}).at(-1),resendKey=`${key}:${sentLog.id}`;
+ assert.equal(saved.delivery_count,2);assert.deepEqual(JSON.parse(saved.delivered_keys_json),[key,resendKey]);emit(w.r,'quote_sent','quotes',historical.id,key);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);
+ const executions=w.r.list('automation_executions',{automation_id:rule.id});assert.equal(executions.length,2);assert.ok(executions.some(e=>e.idempotency_key===`${rule.id}:${resendKey}`));
+ emit(w.r,'quote_sent','quotes',historical.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),executions);
+});
+
+test('Astra 6 P2: delayed custom field revisions cannot overwrite newer saves',async t=>{
+ const {w,request}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Revision',field_key:'revision',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ const newest=await request('custom-field-values','POST',{...data,value_text:'Second',rev_scope:'page-one',revision:2});assert.equal(newest.status,201);
+ w.r.insert('custom_field_values',{...data,value_text:'Duplicate'});
+ const delayed=await request('custom-values','POST',{...data,value_text:'First',rev_scope:'page-one',revision:1});assert.equal(delayed.status,200);assert.equal(delayed.body.value_text,'Second');assert.equal(delayed.body.id,newest.body.id);assert.equal(w.r.list('custom_field_values',data).length,1);
+ const reload=await request('custom-field-values','POST',{...data,value_text:'Reloaded page',rev_scope:'page-two',revision:1});assert.equal(reload.body.value_text,'Reloaded page');
+ const plain=await request('custom-values','POST',{...data,value_text:'API save',revision:0});assert.equal(plain.body.value_text,'API save');
+ const reset=await request('custom-field-values','POST',{...data,value_text:'New sequence',revision:1});assert.equal(reset.body.value_text,'New sequence');
+ const other=await request('custom-field-values','POST',{...data,entity_id:2,value_text:'Independent',revision:0});assert.equal(other.status,201);assert.equal(other.body.value_text,'Independent');
+});
+test('Astra 6 P2: deleting quote messages cannot suppress resends or duplicate retries',async t=>{
+ const {w,request}=await httpFixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/webhook',secret:'test',active:1}),rule=w.r.insert('automations',{name:'Durable send',trigger_event:'quote_sent',action_type:'send_email',action_config_json:'{}',is_enabled:1}),q=w.createQuote({client_id:1,title:'Durable resend'},[{name:'Work',quantity:1,unit_price_cents:1000}]);
+ for(let i=1;i<=3;i++){
+  if(i>1)w.requestChanges(q.id,'Revise');w.sendQuote(q.id);
+  const saved=w.r.get('webhook_subscriptions',sub.id),logs=w.r.list('activity_logs',{entity_type:'quotes',entity_id:q.id,action:'sent'});assert.equal(saved.delivery_count,i);assert.equal(logs.length,i);assert.equal(JSON.parse(saved.last_payload_json).event_key,i===1?`quote_sent:quotes:${q.id}`:`quote_sent:quotes:${q.id}:${logs.at(-1).id}`);
+  for(const message of w.r.list('messages',{related_entity_type:'quotes',related_entity_id:q.id}))assert.equal((await request('messages/'+message.id,'DELETE')).status,200);
+  emit(w.r,'quote_sent','quotes',q.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);assert.equal(w.r.list('automation_executions',{automation_id:rule.id}).length,i);
+ }
+});
+test('Astra 6 P2: invalid legacy job lines return a safe total fallback',async t=>{
+ const {w,request}=await httpFixture(t),job=w.createJob({client_id:1,title:'Corrupt legacy',subtotal_cents:10000,tax_cents:825,total_cents:10825});
+ w.r.insert('preferences',{name:`job_lines:${job.id}`,value_json:JSON.stringify([{name:'Invalid',quantity:1,unit_price_cents:'bad',taxable:1}])});
+ const result=await request('jobs/'+job.id);assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.total_cents,10825);assert.equal(result.body.items.length,1);assert.equal(result.body.items[0].unit_price_cents,10825);assert.equal(result.body.items[0].taxable,0);assert.equal(result.body.tax_rate,0);assert.equal(result.body.discount_value,0);
+});
+test('Astra 6 P2: plan saves reconcile duplicate preferences and use the first row',async t=>{
+ const {w,request}=await httpFixture(t),first=w.r.insert('preferences',{name:'account-plan',value_json:JSON.stringify({plan:'Core'})});
+ w.r.insert('preferences',{name:'account-plan',value_json:JSON.stringify({plan:'Stale'})});assert.equal((await request('account-billing')).body.plan,'Core');
+ const saved=await request('preferences','POST',{name:'account-plan',value_json:{plan:'Grow',price_cents:19900,addons:['AI Receptionist']}});assert.equal(saved.status,200);assert.equal(saved.body.id,first.id);assert.equal(w.r.list('preferences',{name:'account-plan'}).length,1);
+ const billing=(await request('account-billing')).body;assert.equal(billing.plan,'Grow');assert.equal(billing.price_cents,19900);assert.deepEqual(billing.addons,['AI Receptionist']);
+});
+test('Astra 6 P2: delayed global panels cannot replace a newer panel or reopen a closed overlay',async()=>{
+ for(const name of ['settings','notifications','messages'])for(const next of ['close()',"modal('New panel','Current content')",'createMenu()',"globalPanel('help')"]){
+  const h=domHarness();h.elements.set('.create',{classList:{contains:()=>false,add(){},remove(){}},setAttribute(){}});let resolve;
+  h.context.fetch=()=>new Promise(done=>{resolve=done;});const pending=h.run(`globalPanel('${name}')`);await h.run(next);const expected=h.elements.get('#overlay').innerHTML;
+  resolve({ok:true,json:async()=>[]});await pending;assert.equal(h.elements.get('#overlay').innerHTML,expected,`${name} after ${next}`);
+ }
+ const h=domHarness(),responses=[];h.context.fetch=()=>new Promise(resolve=>responses.push(resolve));const first=h.run("globalPanel('settings')"),second=h.run("globalPanel('notifications')");
+ responses[1]({ok:true,json:async()=>[]});await second;const expected=h.elements.get('#overlay').innerHTML;assert.match(expected,/Notifications/);responses[0]({ok:true,json:async()=>[]});await first;assert.equal(h.elements.get('#overlay').innerHTML,expected);
+});
+
+test('Astra 6 regression: every delayed editor and panel respects newer overlay state',async()=>{
+ const starts=[...['updates','language','subscription','rewards','sched-type','sched-team','sched-status','tag-filter','add-entity-tag:jobs:1','add-checklist-item:1','schedule-map'].map(a=>h=>h.run(`gapAction('${a}')`)),h=>h.run("detail('payments',1)"),h=>h.run("detail('clients',1)"),h=>h.run("builder('jobs',1)"),h=>h.run("resource='team';genericBuilder()"),...['unscheduled','billing-payments','find-time'].map(action=>h=>h.click({action})),h=>h.click({appProvider:'test'}),h=>h.click({receipt:'1'}),h=>h.click({slot:'2026-10-26T09:00'})];
+ for(const start of starts)for(const next of ['close()',"modal('New panel','Current content')"]){
+  const h=domHarness();let release;const gate=new Promise(resolve=>{release=resolve;});h.context.fetch=async path=>{await gate;return {ok:true,json:async()=>path==='/api/account-billing'?{addons:[],payments:[{id:1}]}:path==='/api/schedule'?{appointments:[],unscheduled:[]}:path==='/api/ai/route-optimizer'?{stops:[]}:path==='/api/clients/1'||path==='/api/payments/1'?{id:1}:[]};};
+  const pending=start(h);await h.run(next);const expected=h.elements.get('#overlay').innerHTML;release();await pending;assert.equal(h.elements.get('#overlay').innerHTML,expected);assert.equal(h.elements.get('#toast').textContent,'');
+ }
+});
+test('Astra 6 regression: manual jobs apply new tax and preserve simultaneous value and option edits',async t=>{
+ const {w,request}=await httpFixture(t);
+ {
+  const row=w.createJob({client_id:1,title:'Manual tax',total_cents:10000});
+  const before=(await request('jobs/'+row.id)).body;assert.equal(before.tax_cents,0);assert.equal(before.total_cents,10000);assert.equal(before.items[0].taxable,1);
+  const taxed=await submitJobBuilder(request,before,{tax_rate:'10'});assert.equal(taxed.job.tax_cents,1000);assert.equal(taxed.job.total_cents,11000);
+  const combined=await submitJobBuilder(request,taxed.job,{value:'200',tax_rate:'20',discount_type:'fixed',discount_value:'10'});assert.equal(combined.sent.tax_rate,20);assert.equal(combined.sent.discount_type,'fixed');assert.equal(combined.sent.discount_value,1000);assert.equal(combined.job.tax_cents,3800);assert.equal(combined.job.total_cents,22800);
+ }
+});
+test('Astra 6 regression: exempt stored lines remain exempt when the tax rate changes',async t=>{
+ const {request}=await httpFixture(t),created=await request('jobs','POST',{client_id:1,title:'Exempt job',items:[{name:'Exempt',quantity:1,unit_price_cents:10000,taxable:0}],tax_rate:10});assert.equal(created.status,201);
+ const before=(await request('jobs/'+created.body.id)).body,{sent,job}=await submitJobBuilder(request,before,{tax_rate:'15'});assert.equal(sent.items[0].taxable,0);assert.equal(job.items[0].taxable,0);assert.equal(job.tax_rate,15);assert.equal(job.tax_cents,0);assert.equal(job.total_cents,10000);
+});
+test('Astra 6 regression: lifecycle emissions retain base keys and retry once',t=>{
+ const w=fixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/hook',secret:'test',active:1});
+ const check=(event,type,row,action)=>{const saved=w.r.get('webhook_subscriptions',sub.id),log=w.r.list('activity_logs',{entity_type:type,entity_id:row.id,action}).at(-1);assert.ok(log);assert.equal(JSON.parse(saved.last_payload_json).event_key,`${event}:${type}:${row.id}`);emit(w.r,event,type,row.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);};
+ const client=w.createClient({display_name:'Lifecycle',email:'test@example.test',receives_email:1});check('client_created','clients',client,'created');
+ check('request_submitted','requests',w.createRequest({client_id:client.id,title:'Request'}),'created');
+ const quote=w.createQuote({client_id:client.id,title:'Quote'},[]);check('quote_sent','quotes',w.sendQuote(quote.id),'sent');check('quote_approved','quotes',w.approveQuote(quote.id,'Test'),'approved');
+ const job=w.createJob({client_id:client.id,title:'Job'});check('job_completed','jobs',w.completeJob(job.id),'completed');
+ const invoice=w.createInvoice({client_id:client.id,subject:'Invoice'},[{name:'Work',quantity:1,unit_price_cents:1000}]);check('invoice_issued','invoices',w.issueInvoice(invoice.id),'issued');check('payment_received','payments',w.recordPayment({invoice_id:invoice.id,amount_cents:1000}),'received');
+});
+test('Astra 6 regression: deletion clears base keys and executions before entity ID reuse',async t=>{
+ const {w,request}=await httpFixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/hook',secret:'test',active:1});
+ for(const type of ['clients','requests','jobs']){
+  const event={clients:'client_created',requests:'request_submitted',jobs:'job_completed'}[type],create=()=>type==='clients'?w.createClient({display_name:'Reused'}):type==='requests'?w.createRequest({client_id:1,title:'Reused'}):w.completeJob(w.createJob({client_id:1,title:'Reused'}).id);
+  const rule=w.r.insert('automations',{name:'Reuse '+type,trigger_event:event,action_type:'create_task',is_enabled:1}),row=create(),base=`${event}:${type}:${row.id}`;
+  emit(w.r,event,type,row.id,base);const saved=w.r.get('webhook_subscriptions',sub.id),keys=JSON.parse(saved.delivered_keys_json);assert.ok(keys.includes(base));assert.ok(w.r.list('automation_executions',{entity_type:type,entity_id:row.id}).length);
+  assert.equal((await request(type+'/'+row.id,'DELETE')).status,200);assert.equal(w.r.list('automation_executions',{entity_type:type,entity_id:row.id}).length,0);assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),keys.filter(k=>k!==base));
+  const replacement=create();assert.equal(replacement.id,row.id);assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,saved.delivery_count+1);const executions=w.r.list('automation_executions',{automation_id:rule.id});assert.equal(executions.length,1);emit(w.r,event,type,replacement.id);assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,saved.delivery_count+1);
+ }
+});
+
+test('Astra 6 P2: repeated job completion preserves status, logs and automation work',t=>{
+ const w=fixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'job_completed',target_url:'https://example.test/hook',secret:'test',active:1}),rule=w.r.insert('automations',{name:'Complete once',trigger_event:'job_completed',action_type:'create_task',is_enabled:1}),job=w.createJob({client_id:1,title:'Complete once'});
+ w.completeJob(job.id);const logs=w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'}),runs=w.r.list('automation_executions',{automation_id:rule.id}),hook=w.r.get('webhook_subscriptions',sub.id);assert.equal(logs.length,1);assert.equal(runs.length,1);assert.equal(hook.delivery_count,1);
+ const unchanged=()=>{assert.deepEqual(w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'}),logs);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),runs);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),hook);};
+ assert.equal(w.completeJob(job.id).status,'requires_invoicing');unchanged();
+ w.r.update('jobs',job.id,{status:'completed'});assert.equal(w.completeJob(job.id).status,'requires_invoicing');assert.equal(w.r.get('jobs',job.id).status,'requires_invoicing');unchanged();
+ w.invoiceJob(job.id);assert.equal(w.r.get('jobs',job.id).status,'completed');assert.equal(w.completeJob(job.id).status,'completed');unchanged();
+});
+test('Astra 6 P2: legacy lifecycle base keys suppress retries even with activity logs',t=>{
+ const w=fixture(t);
+ for(const [event,type,action] of [['client_created','clients','created'],['request_submitted','requests','created'],['quote_sent','quotes','sent'],['quote_approved','quotes','approved'],['job_completed','jobs','completed'],['invoice_issued','invoices','issued'],['payment_received','payments','received']]){
+  const row=w.r.list(type)[0];assert.ok(row,type);const key=`${event}:${type}:${row.id}`,rule=w.r.insert('automations',{name:event,trigger_event:event,action_type:'create_task',is_enabled:1});
+  if(event==='quote_sent')w.r.db.prepare("UPDATE activity_logs SET entity_id=NULL WHERE entity_type='quotes' AND entity_id=? AND action='sent'").run(row.id);
+  w.r.insert('activity_logs',{entity_type:type,entity_id:row.id,action,summary:'Before upgrade'});
+  const sub=w.r.insert('webhook_subscriptions',{topic:event,target_url:'https://example.test/hook',secret:'test',active:1,delivery_count:1,delivered_keys_json:JSON.stringify([key])}),run=w.r.insert('automation_executions',{automation_id:rule.id,trigger_event:event,entity_type:type,entity_id:row.id,idempotency_key:`${rule.id}:${key}`,status:'succeeded',scheduled_for:new Date().toISOString()});
+  emit(w.r,event,type,row.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),sub);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),[run]);
+ }
+});
+test('Astra 6 P2: interleaved revision scopes and deleted values retain real save results',async t=>{
+ const {w,request,db}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Interleaved',field_key:'interleaved',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ const save=(scope,revision,value)=>request('custom-field-values','POST',{...data,rev_scope:scope,revision,value_text:value});
+ await save('A',2,'A2');await save('B',1,'B1');assert.equal((await save('A',1,'A1')).body.value_text,'B1');assert.equal((await save('A',3,'A3')).body.value_text,'A3');assert.equal((await save('B',0,'B0')).body.value_text,'A3');
+ for(const viaApi of [true,false]){
+  const saved=await save('A',10,'Before deletion');
+  if(viaApi)assert.equal((await request('custom-values/'+saved.body.id,'DELETE')).status,200);else db.prepare('DELETE FROM custom_field_values WHERE id=?').run(saved.body.id);
+  const recreated=await save('A',1,'Recreated');assert.equal(recreated.status,201);assert.ok(recreated.body.id);assert.equal(recreated.body.value_text,'Recreated');assert.equal(w.r.list('custom_field_values',data).length,1);
+  if(viaApi)assert.equal((await save('A',2,'After reset')).body.value_text,'After reset');
+ }
+ await request('custom-values','POST',{...data,value_text:'Unscoped'});assert.equal((await save('A',0,'Reset')).body.value_text,'Reset');
+});
+test('Astra 6 P2: visit deletion clears visit and reminder keys before ID reuse',async t=>{
+ const {w,request}=await httpFixture(t),job=w.createJob({client_id:1,title:'Visits'}),sub=w.r.insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/hook',secret:'test',active:1});
+ const scheduled=w.r.insert('automations',{name:'Visit scheduled',trigger_event:'job_scheduled',action_type:'create_task',is_enabled:1}),reminder=w.r.insert('automations',{name:'Visit reminder',trigger_event:'visit_approaching',action_type:'create_task',is_enabled:1}),visit=w.createVisit(job.id),key=`reminder:${visit.id}:2099-01-01T00:00:00.000Z`;
+ emit(w.r,'visit_approaching','jobs',job.id,key);emit(w.r,'visit_completed','visits',visit.id,`visit_completed:visits:${visit.id}:99`);
+ const before=w.r.get('webhook_subscriptions',sub.id),keep=`visit:${visit.id+1}`;w.r.update('webhook_subscriptions',sub.id,{delivered_keys_json:JSON.stringify([...JSON.parse(before.delivered_keys_json),keep])});
+ assert.equal((await request('visits/'+visit.id,'DELETE')).status,200);assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),[keep]);for(const rule of [scheduled,reminder])assert.equal(w.r.list('automation_executions',{automation_id:rule.id}).length,0);
+ const replacement=w.createVisit(job.id);assert.equal(replacement.id,visit.id);emit(w.r,'visit_approaching','jobs',job.id,key);assert.equal(w.r.get('webhook_subscriptions',sub.id).delivery_count,before.delivery_count+2);for(const rule of [scheduled,reminder])assert.equal(w.r.list('automation_executions',{automation_id:rule.id}).length,1);
+});
+test('Astra 6 P2: deleted quote logs are preserved but detached before ID reuse',async t=>{
+ const {w,request}=await httpFixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'quote_sent',target_url:'https://example.test/hook',secret:'test',active:1}),q=w.createQuote({client_id:1,title:'Old quote'},[]);
+ w.sendQuote(q.id);w.requestChanges(q.id,'Again');w.sendQuote(q.id);const logs=w.r.list('activity_logs',{entity_type:'quotes',entity_id:q.id});assert.equal((await request('quotes/'+q.id,'DELETE')).status,200);
+ for(const log of logs)assert.equal(w.r.get('activity_logs',log.id).entity_id,null);assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),[]);
+ const replacement=w.createQuote({client_id:1,title:'New quote'},[]);assert.equal(replacement.id,q.id);w.sendQuote(replacement.id);const hook=w.r.get('webhook_subscriptions',sub.id);assert.equal(hook.delivery_count,3);assert.equal(JSON.parse(hook.last_payload_json).event_key,`quote_sent:quotes:${q.id}`);assert.equal(w.r.list('activity_logs',{entity_type:'quotes',entity_id:q.id,action:'sent'}).length,1);
+});
+test('Astra 6 P2: delayed writes and subsequent reads cannot replace overlay state',async()=>{
+ for(const action of ['claim-rewards','new-tag','remove-entity-tag:1:payments:1','toggle-checklist-item:1:payments:1'])for(const pause of [0,1,2])for(const next of ['close()',"modal('New panel','Current content')"]){
+  const h=domHarness();h.elements.set('#new-tag-form',{});h.context.FormData=class{get(){return 'New tag';}};
+  if(action==='new-tag')await h.run("gapAction('tag-filter')");else h.run("modal('Original','Old content')");
+  let release,reached;const blocked=new Promise(resolve=>{reached=resolve;}),gate=new Promise(resolve=>{release=resolve;});let count=0;
+  h.context.fetch=async(path,options)=>{h.calls.push({path,options});if(count++===pause){reached();await gate;}return {ok:true,json:async()=>path==='/api/payments/1'?{id:1}:path==='/api/checklist-items/1'?{id:1,is_completed:0}:[]};};
+  const pending=action==='new-tag'?h.elements.get('#new-tag-form').onsubmit({preventDefault(){},target:{}}):h.run(`gapAction('${action}')`);
+  const state=await Promise.race([blocked.then(()=>true),pending.then(()=>false)]);if(!state)continue;
+  await h.run(next);const expected=h.elements.get('#overlay').innerHTML;release();await pending;assert.equal(h.elements.get('#overlay').innerHTML,expected,`${action} pause ${pause} after ${next}`);
+ }
+});
+
+test('Astra 6 P2: subsequent visit-based billing reopens completed jobs without rebilling visits',t=>{
+ const w=fixture(t),job=w.createJob({client_id:1,title:'Recurring billing',billing_type:'visit_based',total_cents:2500});
+ const first=w.createVisit(job.id);w.completeVisit(first.id);w.completeJob(job.id);const invoice=w.invoiceJob(job.id);assert.equal(invoice.total_cents,2500);assert.equal(w.r.get('jobs',job.id).status,'completed');
+ const second=w.createVisit(job.id);
+ for(const status of ['completed','requires_invoicing']){w.r.update('jobs',job.id,{status});assert.throws(()=>w.completeJob(job.id),/open visits/);assert.equal(w.r.get('jobs',job.id).status,status);}
+ w.r.update('jobs',job.id,{status:'completed'});w.completeVisit(second.id);assert.equal(w.completeJob(job.id).status,'requires_invoicing');const next=w.invoiceJob(job.id);assert.notEqual(next.id,invoice.id);assert.equal(next.total_cents,2500);assert.deepEqual(w.r.list('invoice_line_items',{invoice_id:next.id}).map(l=>l.visit_id),[second.id]);assert.equal(w.r.get('visits',first.id).invoice_id,invoice.id);
+ const logs=w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'});assert.equal(w.completeJob(job.id).status,'completed');assert.deepEqual(w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'}),logs);
+});
+test('Astra 6 P2: failed custom field writes neither advance nor clear revision tracking',async t=>{
+ const {w,request,db}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Failed revision',field_key:'failed_revision',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ db.exec("CREATE TRIGGER reject_custom_update BEFORE UPDATE ON custom_field_values WHEN NEW.value_text='Reject' BEGIN INSERT INTO organizations(id,name,slug) VALUES (1,'dup','dup'); END; CREATE TRIGGER reject_custom_insert BEFORE INSERT ON custom_field_values WHEN NEW.value_text='Reject' BEGIN INSERT INTO organizations(id,name,slug) VALUES (1,'dup','dup'); END;");
+ const save=(value_text,extra={})=>request('custom-field-values','POST',{...data,value_text,...extra});
+ assert.equal((await save('Initial',{rev_scope:'A',revision:2})).status,201);
+ assert.ok((await save('Reject',{rev_scope:'A',revision:100})).status>=400);
+ assert.equal((await save('Next',{rev_scope:'A',revision:3})).body.value_text,'Next');
+ assert.ok((await save('Reject')).status>=400);
+ assert.equal((await save('Stale',{rev_scope:'A',revision:1})).body.value_text,'Next');
+ assert.equal(w.r.list('custom_field_values',data)[0].value_text,'Next');
+ assert.equal((await save('Unversioned',{rev_scope:'A'})).body.value_text,'Unversioned');
+ assert.equal((await save('Reset',{rev_scope:'A',revision:0})).body.value_text,'Reset');
+ data.entity_id=2;assert.ok((await save('Reject',{rev_scope:'A',revision:100})).status>=400);
+ assert.equal((await save('Inserted',{rev_scope:'A',revision:1})).status,201);
+ assert.equal((await save('After insert',{rev_scope:'A',revision:2})).body.value_text,'After insert');
+});
+test('Astra 6 P2: invalid custom field revisions and scopes reject without mutating state',async t=>{
+ const {w,request}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Invalid revision',field_key:'invalid_revision',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ const save=(value_text,extra={})=>request('custom-field-values','POST',{...data,value_text,rev_scope:'A',...extra});
+ assert.equal((await save('Initial',{revision:2})).status,201);const initial=w.r.list('custom_field_values',data);
+ assert.equal((await save('Invalid',{revision:'invalid'})).status,400);assert.deepEqual(w.r.list('custom_field_values',data),initial);
+ assert.equal((await save('Next',{revision:3})).body.value_text,'Next');
+ assert.equal((await save('Stale',{revision:1})).body.value_text,'Next');const saved=w.r.list('custom_field_values',data);
+ for(const extra of [...['',-1,1.5,null,true,{}].map(revision=>({revision})),...['','   ',null,123].map(rev_scope=>({rev_scope,revision:100}))]){
+  assert.equal((await save('Invalid',extra)).status,400);assert.deepEqual(w.r.list('custom_field_values',data),saved);
+  assert.equal((await save('Stale',{revision:1})).body.value_text,'Next');assert.deepEqual(w.r.list('custom_field_values',data),saved);
+ }
+ assert.equal((await save('Later',{revision:4})).body.value_text,'Later');
+});
+test('Astra 6 P2: concurrent checklist clicks persist both toggles after the panel changes',async()=>{
+ const h=domHarness();let release;const gate=new Promise(resolve=>{release=resolve;});
+ h.context.fetch=async(path,options)=>{h.calls.push({path,options});if(path==='/api/checklist-items/1')await gate;return {ok:true,json:async()=>({id:path.endsWith('/1')?1:2,is_completed:0})};};
+ h.run("detail=async()=>{modal('Refreshed drawer','Saved')}");
+ const first=h.run("gapAction('toggle-checklist-item:1:jobs:9')");await h.run("gapAction('toggle-checklist-item:2:jobs:9')");
+ h.run("modal('Unrelated editor','Unsaved content')");const expected=h.elements.get('#overlay').innerHTML;release();await first;
+ const writes=h.calls.filter(c=>c.options.method==='POST');assert.deepEqual(writes.map(c=>c.path).sort(),['/api/checklist-items/1/complete','/api/checklist-items/2/complete']);for(const call of writes)assert.deepEqual(JSON.parse(call.options.body),{completed:true});assert.equal(h.elements.get('#overlay').innerHTML,expected);
+});
+test('Astra 6 P2: delayed mark-read removes badges without closing a newer editor',async()=>{
+ for(const next of [null,'close()',"modal('Unrelated editor','Unsaved content')"]){
+  const h=domHarness();let release;const gate=new Promise(resolve=>{release=resolve;});let dots=0,badges=0;
+  h.elements.set('#updatesBtn .badge-dot',{remove(){dots++;}});h.context.document.querySelectorAll=s=>s==='.updates-badge'?[{remove(){badges++;}}]:[];
+  h.context.fetch=async(path,options)=>{h.calls.push({path,options});await gate;return {ok:true,json:async()=>({})};};
+  h.run("modal('Updates','Mark read')");const pending=h.run("gapAction('mark-updates-read')");if(next)h.run(next);const expected=h.elements.get('#overlay').innerHTML;release();await pending;
+  assert.equal(dots,1);assert.equal(badges,1);assert.equal(h.calls.length,1);assert.equal(h.calls[0].options.method,'POST');
+  if(next){assert.equal(h.elements.get('#overlay').innerHTML,expected);assert.equal(h.elements.get('#toast').textContent,'');}else{assert.equal(h.elements.get('#overlay').innerHTML,'');assert.equal(h.elements.get('#toast').textContent,'All updates marked as read');}
+ }
+});
+
+test('Astra 6 P2: equal revision retries preserve a newer save from another scope',async t=>{
+ const {w,request}=await httpFixture(t),field=w.r.insert('custom_field_definitions',{entity_type:'jobs',field_name:'Replay',field_key:'replay',field_type:'text'}),data={field_definition_id:field.id,entity_type:'jobs',entity_id:1};
+ const save=(path,rev_scope,revision,value_text)=>request(path,'POST',{...data,rev_scope,revision,value_text});
+ const first=await save('custom-field-values','A',1,'A1');assert.equal(first.status,201);
+ assert.equal((await save('custom-values','B',1,'B1')).body.value_text,'B1');
+ for(const path of ['custom-field-values','custom-values']){const retry=await save(path,'A',1,'A1');assert.equal(retry.status,200);assert.equal(retry.body.id,first.body.id);assert.equal(retry.body.value_text,'B1');}
+ assert.equal(w.r.list('custom_field_values',data)[0].value_text,'B1');assert.equal((await save('custom-values','A',2,'A2')).body.value_text,'A2');
+});
+test('Astra 6 P2: concurrent checklist saves refresh the same drawer after each completion',async()=>{
+ const h=domHarness(),completed=new Set();let release;const gate=new Promise(resolve=>{release=resolve;});
+ h.run("modal('Checklist','Initial')");const version=h.run('panelVersion');
+ h.context.fetch=async(path,options)=>{if(path==='/api/checklist-items/1/complete')await gate;if(options.method==='POST')completed.add(path.split('/')[3]);return {ok:true,json:async()=>path==='/api/jobs/9'?{id:9,title:'Checklist'}:path.includes('/checklist-items/')?{is_completed:0}:[]};};
+ h.context.completed=completed;h.run("entitySections=async()=>[...completed].sort().join(',')");
+ const first=h.run("gapAction('toggle-checklist-item:1:jobs:9')");await h.run("gapAction('toggle-checklist-item:2:jobs:9')");assert.equal(h.run('panelVersion'),version);
+ release();await first;assert.match(h.elements.get('#overlay').innerHTML,/1,2/);assert.equal(h.run('panelVersion'),version);
+});
+test('Astra 6 P2: older detail responses cannot overwrite the latest in-place refresh',async()=>{
+ for(const pause of ['record','sections']){
+  const h=domHarness();h.run("modal('Checklist','Initial')");let release,reached;const gate=new Promise(resolve=>{release=resolve;}),blocked=new Promise(resolve=>{reached=resolve;});let records=0,sections=0;
+  h.context.fetch=async path=>{if(path==='/api/jobs/9'){const n=++records;if(pause==='record'&&n===1){reached();await gate;}return {ok:true,json:async()=>({id:9,title:n===1?'Old snapshot':'Latest snapshot'})};}return {ok:true,json:async()=>[]};};
+  h.context.sections=async()=>{if(pause==='sections'&&++sections===1){reached();await gate;}return '';};h.run('entitySections=sections');
+  const first=h.run("detail('jobs',9,panelVersion)");await blocked;await h.run("detail('jobs',9,panelVersion)");const expected=h.elements.get('#overlay').innerHTML;assert.match(expected,/Latest snapshot/);release();await first;assert.equal(h.elements.get('#overlay').innerHTML,expected);
+ }
+});
+test('Astra 6 P2: rewards and tag-filter refreshes preserve their panel version',async()=>{
+ for(const action of ['rewards','tag-filter']){const h=domHarness();h.elements.set('#new-tag-form',{});await h.run(`gapAction('${action}')`);const version=h.run('panelVersion');await h.run(`gapAction('${action}',panelVersion)`);assert.equal(h.run('panelVersion'),version);await h.run(`gapAction('${action}')`);assert.ok(h.run('panelVersion')>version);}
+});
+test('Astra 6 P2: webhook deliveries roll back when automation emission fails',async t=>{
+ const {w,request}=await httpFixture(t),sub=w.r.insert('webhook_subscriptions',{topic:'client_created',target_url:'https://example.test/hook',secret:'test',active:1});
+ w.r.insert('automations',{name:'Invalid conditions',trigger_event:'client_created',action_type:'create_task',is_enabled:1,conditions_json:'null'});
+ const originalError=console.error;console.error=()=>{};
+ try{assert.ok((await request('automations/run','POST',{event:'client_created',entity_type:'clients',entity_id:1})).status>=500);}finally{console.error=originalError;}
+ const saved=w.r.get('webhook_subscriptions',sub.id);assert.equal(saved.delivery_count,0);assert.equal(saved.delivered_keys_json,'[]');
+});
+test('Astra 6 P2: delayed actionForm and builder saves do not close or overwrite a newer editor',async()=>{
+ for(const form of ['action-form','builder'])for(const pause of (form==='builder'?[0,1]:[0])){
+  const h=domHarness();h.run('render=async()=>{throw Error("Unexpected render")}');
+  if(form==='action-form')await h.run("gapAction('language')");else await h.run("builder('clients')");
+  let release,reached,count=0;const gate=new Promise(resolve=>{release=resolve;}),blocked=new Promise(resolve=>{reached=resolve;});
+  h.context.fetch=async(path,options)=>{h.calls.push({path,options});if(count++===pause){reached();await gate;}return {ok:true,json:async()=>[]};};
+  const pending=h.elements.get('#'+form).onsubmit({preventDefault(){},target:{values:form==='action-form'?{language:'Français'}:{display_name:'Saved client'}}});
+  await blocked;h.run("modal('Newer editor','Unsaved input')");const expected=h.elements.get('#overlay').innerHTML;release();await pending;
+  assert.match(h.elements.get('#overlay').innerHTML,/Newer editor/);assert.match(h.elements.get('#overlay').innerHTML,/Unsaved input/);assert.equal(h.elements.get('#overlay').innerHTML,expected);assert.equal(h.elements.get('#toast').textContent,'');
+ }
+});
+test('Astra 6 P2: recurring completions emit distinct events while retries remain idempotent',t=>{
+ const w=fixture(t),job=w.createJob({client_id:1,title:'Recurring events',billing_type:'visit_based',total_cents:2500}),sub=w.r.insert('webhook_subscriptions',{topic:'job_completed',target_url:'https://example.test/hook',secret:'test',active:1}),rule=w.r.insert('automations',{name:'Each completion',trigger_event:'job_completed',action_type:'create_task',is_enabled:1}),keys=[];
+ for(let i=1;i<=3;i++){
+  const visit=w.createVisit(job.id);w.completeVisit(visit.id);w.completeJob(job.id);
+  const saved=w.r.get('webhook_subscriptions',sub.id),logs=w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'}),key=JSON.parse(saved.last_payload_json).event_key;assert.equal(saved.delivery_count,i);assert.equal(logs.length,i);assert.equal(key,i===1?`job_completed:jobs:${job.id}`:`job_completed:jobs:${job.id}:${logs.at(-1).id}`);assert.ok(!keys.includes(key));keys.push(key);
+  const runs=w.r.list('automation_executions',{automation_id:rule.id});assert.equal(runs.length,i);assert.deepEqual(JSON.parse(saved.delivered_keys_json),keys);
+  emit(w.r,'job_completed','jobs',String(job.id));for(const oldKey of keys)emit(w.r,'job_completed','jobs',job.id,oldKey);w.completeJob(job.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);assert.deepEqual(w.r.list('automation_executions',{automation_id:rule.id}),runs);w.invoiceJob(job.id);
+ }
+});
+test('Astra 6 P2: deleted job logs are detached before a reused ID emits its base key',async t=>{
+ const {w,request}=await httpFixture(t),job=w.createJob({client_id:1,title:'Old job'}),sub=w.r.insert('webhook_subscriptions',{topic:'job_completed',target_url:'https://example.test/hook',secret:'test',active:1});w.completeJob(job.id);
+ const logs=w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id});assert.ok(logs.length);assert.equal((await request('jobs/'+job.id,'DELETE')).status,200);for(const log of logs)assert.equal(w.r.get('activity_logs',log.id).entity_id,null);
+ assert.deepEqual(JSON.parse(w.r.get('webhook_subscriptions',sub.id).delivered_keys_json),[]);const replacement=w.createJob({client_id:1,title:'Replacement'});assert.equal(replacement.id,job.id);w.completeJob(replacement.id);
+ const saved=w.r.get('webhook_subscriptions',sub.id);assert.equal(saved.delivery_count,2);assert.equal(JSON.parse(saved.last_payload_json).event_key,`job_completed:jobs:${job.id}`);assert.equal(w.r.list('activity_logs',{entity_type:'jobs',entity_id:job.id,action:'completed'}).length,1);emit(w.r,'job_completed','jobs',job.id);assert.deepEqual(w.r.get('webhook_subscriptions',sub.id),saved);
+});
 
 const artwork=['quotes_deep_lawn','marketing_reviews_art','timesheets_banner_art','expenses_forwarding_art','onboarding_avatar'];
 test('Astra 1: refund writes require the reconciliation workflow',async t=>{

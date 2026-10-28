@@ -24,6 +24,16 @@ Settings sections: company/business-profile, client-hub, requests-and-bookings/o
 
 Authenticated requests accept Bearer, `X-Jobber-Token`, or `_jobber_session` cookie tokens. Cookie writes require `X-CSRF-Token` obtained from `GET /api/csrf`. Login/bootstrap set HttpOnly/SameSite=Lax cookies; logout clears them. Resource access is mapped to role permissions, then repository operations constrain organization IDs. Public portal requests use a client token instead of a workspace session.
 
+## Gap controls and developer webhooks
+
+- Account controls persist `product-updates`, `workspace-language`, `account-plan`, and `rewards-claimed` via `POST /api/preferences` (upsert by name). Billing merges the selected plan, price in cents, and add-ons while retaining payment history.
+- Schedule Type/Team/Status pills filter appointments locally. Map uses `POST /api/ai/route-optimizer`; its SVG is a coordinate schematic with an ordered stop table and approximate straight-line segment distances, not road directions.
+- Client tag filtering uses `/api/tags` and `/api/entity-tags`. Drawers expose tags, `/api/custom-fields`, `/api/custom-field-values` (alias of custom-values), checklist completion, and text attachments.
+- `GET /api/jobs/:id` hydrates stored job lines/options, selected quote lines, or a fallback total line. Job builders submit line items and tax/discount options to the existing calculation pipeline.
+- `/api/webhooks` supports GET/POST; `/api/webhooks/:id` supports GET/PATCH/PUT/DELETE, with organization scoping and automations permissions. URL aliases: `target_url`, `webhook_url`, `url`. Active defaults to 1; omitted secrets are generated with a `whsec_` prefix.
+- `POST /api/webhooks/:id/test` records a signed sandbox delivery. Event emission matches `*`, exact topics, or normalized aliases such as `CLIENT_CREATE` / `client_created`. Delivery records contain the exact JSON payload and its Base64 HMAC-SHA256 signature, count and timestamp. Like the existing messaging integrations, this implementation records local deliveries; it does not issue outbound HTTP requests.
+- GraphQL: `webhookSubscription`, `webhookSubscriptions`, `webhookSubscriptionCreate`, `webhookSubscriptionEdit`, `webhookSubscriptionDelete`. URL input/output aliases: `targetUrl`, `webhookUrl`, `url`; `active` returns a boolean. Global IDs and automations permission checks apply.
+
 ## Developer GraphQL and OAuth
 
 - `GET/POST /api/graphql`, `GET/POST /graphql`: authenticated query execution; mutations require POST. Version header `X-JOBBER-GRAPHQL-VERSION` is echoed, defaulting to `2025-01-20`.

@@ -1,5 +1,6 @@
 // Compact declarations are expanded into strict SQLite tables and tenant-aware foreign keys.
 export const definitions = {
+ webhook_subscriptions: 'organization_id! topic! target_url! secret active? delivery_count$ last_delivered_at last_payload_json last_signature delivered_keys_json created_at',
  invoice_credits: 'organization_id! invoice_id! amount_cents$ reason created_at',
  preferences: 'organization_id! name! value_json',
  subscription_payments: 'organization_id! date! description! amount_cents$ receipt_number!',
@@ -57,7 +58,7 @@ export function migrate(db) {
    if (raw.includes('!')) sql += ' NOT NULL';
    if (choices) sql += ` NOT NULL DEFAULT '${choices.split('|')[0]}' CHECK (${name} IN (${choices.split('|').map(v=>`'${v}'`).join(',')}))`;
    else if (/[$?#]/.test(raw)) sql += ` NOT NULL DEFAULT ${name === 'quantity' || name === 'interval_count' ? 1 : 0}`;
-   else if (name.endsWith('_json')) sql += ` DEFAULT '${name.includes('ids') || name.includes('week') ? '[]' : '{}'}' CHECK(json_valid(${name}))`;
+   else if (name.endsWith('_json')) sql += ` DEFAULT '${name.includes('ids') || name.includes('week') || name==='delivered_keys_json' ? '[]' : '{}'}' CHECK(json_valid(${name}))`;
    else if (name === 'created_at' || name === 'updated_at') sql += " NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
    if (raw.includes('?')) sql += ` CHECK (${name} IN (0,1))`;
    if (name.endsWith('_cents') && !['balance_cents','profit_cents','net_cents'].includes(name)) sql += ` CHECK (${name} >= 0)`;
@@ -71,6 +72,7 @@ export function migrate(db) {
   }
   db.exec(`CREATE TABLE IF NOT EXISTS ${table} (${parts.join(',')}) STRICT`);
  }
+ if(!db.prepare('PRAGMA table_info(webhook_subscriptions)').all().some(c=>c.name==='delivered_keys_json'))db.exec("ALTER TABLE webhook_subscriptions ADD COLUMN delivered_keys_json TEXT DEFAULT '[]'");
  if(!db.prepare('PRAGMA table_info(visits)').all().some(c=>c.name==='occurrence_start'))db.exec('ALTER TABLE visits ADD COLUMN occurrence_start TEXT');
  db.exec('UPDATE visits SET occurrence_start=scheduled_start WHERE occurrence_start IS NULL AND scheduled_start IS NOT NULL');
  if(!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='website'))db.exec('ALTER TABLE organizations ADD COLUMN website TEXT');

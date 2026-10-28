@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,39 @@ import { startServer } from '../src/server.js';
 import { encodeGid, decodeGid, parseGraphQL, normalizeInput, executeGraphQL, maxJobLineSeq, saveJobLineSeq, readJobOptions, storeJobOptions, storeJobLines, hydrateJobState } from '../src/services/graphql.js';
 import { calculateDocument } from '../src/services/calculations.js';
 import { createAuth, requestToken } from '../src/services/api-auth.js';
+import { emit } from '../src/services/automations.js';
+import { workflows } from '../src/services/workflows.js';
+import { migrate } from '../src/db/schema.js';
+
+test('Astra 6 audit: bootstrap creates isolated browser sessions and rejects GET',async t=>{
+ const db=createDatabase();seedDatabase(db);const server=await startServer({db,seed:false,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});
+ const sessions=[];for(let i=0;i<2;i++){const res=await fetch(server.url+'/api/auth/bootstrap',{method:'POST'});assert.equal(res.status,200);const session=await res.json();assert.ok(res.headers.get('set-cookie').includes(session.token));sessions.push(session);}
+ assert.notEqual(sessions[0].token,sessions[1].token);
+ const get=await fetch(server.url+'/api/auth/bootstrap',{headers:{'sec-fetch-site':'same-origin','content-type':'application/json'}});assert.notEqual(get.status,200);assert.ok(!(await get.json()).token);
+ const call=(path,token,data)=>fetch(server.url+'/api/'+path,{method:data?'POST':'GET',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:data?JSON.stringify(data):undefined});
+ assert.equal((await call('auth/switch-user',sessions[0].token,{user_id:3})).status,200);assert.equal((await (await call('auth/me',sessions[1].token)).json()).user.id,1);
+ await call('auth/logout',sessions[0].token,{});assert.equal((await call('auth/me',sessions[1].token)).status,200);
+});
+test('Astra 6 audit: job embeds obey resource read permissions',async t=>{
+ const {db,r,owner,call,headers}=await fixture(t),w=workflows(db,1,owner.id),property=r.list('properties')[0],job=w.createJob({client_id:property.client_id,property_id:property.id,title:'Restricted embeds'});w.createVisit(job.id);r.insert('time_entries',{user_id:owner.id,job_id:job.id,start_at:'2026-10-01T10:00Z'});r.insert('invoices',{client_id:property.client_id,job_id:job.id,subject:'Private invoice'});
+ const allowed=await call('/api/jobs/'+job.id,{headers});assert.ok(allowed.body.client);assert.ok(allowed.body.property);assert.equal(allowed.body.visits.length,1);assert.equal(allowed.body.time_entries.length,1);assert.equal(allowed.body.invoices.length,1);assert.ok(allowed.body.costing);
+ db.prepare("UPDATE permissions SET allowed=0 WHERE role_id=? AND resource IN ('clients','schedule','team','invoices') AND action='read'").run(owner.role_id);
+ assert.equal((await call('/api/jobs/'+job.id+'/costing',{headers})).status,403);
+ const denied=await call('/api/jobs/'+job.id,{headers});assert.equal(denied.status,200);for(const key of ['client','property','costing'])assert.equal(denied.body[key],null);for(const key of ['visits','time_entries','invoices'])assert.deepEqual(denied.body[key],[]);
+});
+test('Astra 6 audit: unchanged discounted taxed job preserves cents',async t=>{
+ const {db,owner,call,headers}=await fixture(t),w=workflows(db,1,owner.id),job=w.createJob({client_id:1,title:'Discount and tax',subtotal_cents:10000,tax_cents:900,total_cents:9900});
+ const loaded=await call('/api/jobs/'+job.id,{headers}),{items,tax_rate,discount_type,discount_value}=loaded.body;assert.equal(tax_rate,10);assert.equal(discount_value,1000);assert.equal(items[0].total_cents,10000);
+ const saved=await call('/api/jobs/'+job.id,{method:'PATCH',headers,data:{items,tax_rate,discount_type,discount_value}});assert.equal(saved.status,200);assert.equal(saved.body.tax_cents,900);assert.equal(saved.body.total_cents,9900);
+});
+test('Astra 6 audit: recurring webhook keys persist and cannot be overwritten',async t=>{
+ const {db,r,owner,call,headers}=await fixture(t),w=workflows(db,1,owner.id),sub=r.insert('webhook_subscriptions',{topic:'invoice_overdue',target_url:'https://example.test/hook',active:1});assert.deepEqual(JSON.parse(sub.delivered_keys_json),[]);
+ const invoice=w.createInvoice({client_id:1,subject:'Overdue'},[{name:'Work',quantity:1,unit_price_cents:1000}]);w.issueInvoice(invoice.id);r.update('invoices',invoice.id,{due_date:'2000-01-01'});
+ w.overdue();const first=r.get('webhook_subscriptions',sub.id);assert.ok(first.delivery_count>0);w.overdue();assert.deepEqual(r.get('webhook_subscriptions',sub.id),first);
+ emit(r,'invoice_overdue','invoices',invoice.id,'new-event');emit(r,'invoice_overdue','invoices',invoice.id,'new-event');assert.equal(r.get('webhook_subscriptions',sub.id).delivery_count,first.delivery_count+1);
+ for(const field of ['delivery_count','last_delivered_at','last_payload_json','last_signature','delivered_keys_json'])assert.equal((await call('/api/webhooks/'+sub.id,{method:'PATCH',headers,data:{[field]:field==='delivery_count'?0:'[]'}})).status,400);
+ db.exec('ALTER TABLE webhook_subscriptions DROP COLUMN delivered_keys_json');migrate(db);migrate(db);assert.deepEqual(JSON.parse(r.get('webhook_subscriptions',sub.id).delivered_keys_json),[]);emit(r,'invoice_overdue','invoices',invoice.id,'migrated-event');emit(r,'invoice_overdue','invoices',invoice.id,'migrated-event');assert.equal(r.get('webhook_subscriptions',sub.id).delivery_count,first.delivery_count+2);
+});
 
 async function fixture(t){
  const db=createDatabase();seedDatabase(db);const r=repository(db,1),owner=r.list('users')[0];db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword('test-password-123'),owner.id);
@@ -19,6 +53,48 @@ async function fixture(t){
  const mutate=async(name,input,field,selection='id legacyId')=>{const result=await gql(`mutation($input: Input!){${name}(input:$input){${field}{${selection}} userErrors{message path}}}`,{input});assert.equal(result.errors,undefined,JSON.stringify(result));assert.deepEqual(result.data[name].userErrors,[],JSON.stringify(result));return result.data[name][field];};
  return {db,r,owner,call,headers,gql,mutate,login};
 }
+
+test('Webhook subscriptions: GraphQL CRUD, aliases, signed events and tenant isolation',async t=>{
+ const {mutate,gql,call,headers,r,db}=await fixture(t);
+ const sub=await mutate('webhookSubscriptionCreate',{topic:'CLIENT_CREATE',webhookUrl:'https://example.test/hook',secret:'test-secret'},'webhookSubscription','id legacyId topic targetUrl webhookUrl url active deliveryCount');
+ assert.equal(sub.active,true);assert.equal(sub.targetUrl,sub.webhookUrl);assert.equal(sub.url,sub.targetUrl);
+ for(const field of ['targetUrl','webhookUrl','url']){
+  const result=await gql(`{webhookSubscriptions(filter:{${field}:{eq:"https://example.test/hook"}}){nodes{id} totalCount}}`);
+  assert.equal(result.errors,undefined);assert.equal(result.data.webhookSubscriptions.totalCount,1);assert.deepEqual(result.data.webhookSubscriptions.nodes,[{id:sub.id}]);
+  const missing=await gql(`{webhookSubscriptions(filter:{${field}:"https://example.test/missing"}){totalCount}}`);
+  assert.equal(missing.errors,undefined);assert.equal(missing.data.webhookSubscriptions.totalCount,0);
+ }
+ for(const searchTerm of ['client_create','EXAMPLE.TEST/HOOK','no-matching-webhook']){
+  const result=await gql('query($term:String!){webhookSubscriptions(searchTerm:$term){nodes{id} totalCount}}',{term:searchTerm});
+  assert.equal(result.errors,undefined);assert.deepEqual(result.data.webhookSubscriptions.nodes,searchTerm==='no-matching-webhook'?[]:[{id:sub.id}]);
+ }
+ for(const [name,input,message] of [
+  ['webhookSubscriptionCreate',{topic:'*',url:'javascript:bad'},'Invalid webhook URL'],
+  ['webhookSubscriptionCreate',{webhookUrl:'https://example.test/missing-topic'},'Webhook topic is required'],
+  ['webhookSubscriptionCreate',{topic:'*'},'Invalid webhook URL'],
+  ['webhookSubscriptionCreate',{topic:'*',url:'https://example.test/hook',secret:'   '},'Invalid webhook secret'],
+  ['webhookSubscriptionCreate',{topic:'*',url:'https://example.test/hook',unexpected:true},'Invalid webhook field'],
+  ['webhookSubscriptionEdit',{id:sub.id,url:'not-a-url'},'Invalid webhook URL'],
+  ['webhookSubscriptionEdit',{id:sub.id},'No webhook fields provided'],
+  ['webhookSubscriptionEdit',{id:sub.id,secret:''},'Invalid webhook secret'],
+  ['webhookSubscriptionEdit',{id:sub.id,active:'true'},'Invalid webhook active flag']
+ ]){
+  const result=await gql(`mutation($input:Input!){${name}(input:$input){webhookSubscription{id} userErrors{message path}}}`,{input});
+  assert.equal(result.errors,undefined,JSON.stringify(result));assert.equal(result.data[name].webhookSubscription,null);assert.deepEqual(result.data[name].userErrors,[{message,path:[]}]);
+ }
+ assert.equal(r.list('webhook_subscriptions').length,1);assert.equal(r.get('webhook_subscriptions',sub.legacyId).target_url,sub.targetUrl);
+ const foreign=repository(db,2).insert('webhook_subscriptions',{topic:'*',target_url:'https://example.test/foreign',active:1});
+ await mutate('clientCreate',{name:'Webhook client'},'client');
+ let stored=r.get('webhook_subscriptions',sub.legacyId);assert.equal(stored.delivery_count,1);assert.equal(stored.last_signature,createHmac('sha256','test-secret').update(stored.last_payload_json).digest('base64'));
+ assert.equal(repository(db,2).get('webhook_subscriptions',foreign.id).delivery_count,0);
+ await mutate('webhookSubscriptionEdit',{id:sub.id,active:false,url:'https://example.test/edited'},'webhookSubscription','id active url');
+ await mutate('clientCreate',{name:'No delivery'},'client');assert.equal(r.get('webhook_subscriptions',sub.legacyId).delivery_count,1);
+ const tested=await call('/api/webhooks/'+sub.legacyId+'/test',{method:'POST',headers,data:{}});assert.equal(tested.status,200);assert.equal(tested.body.delivery_count,2);
+ const listed=await gql('{webhookSubscriptions{nodes{id active url}}}');assert.equal(listed.errors,undefined);assert.ok(listed.data.webhookSubscriptions.nodes.some(s=>s.id===sub.id&&!s.active));
+ const deleted=await gql('mutation($id:ID!){webhookSubscriptionDelete(id:$id){deletedId userErrors{message}}}',{id:sub.id});assert.deepEqual(deleted.data.webhookSubscriptionDelete.userErrors,[]);assert.equal(deleted.data.webhookSubscriptionDelete.deletedId,sub.id);
+ const defaults=await call('/api/webhooks',{method:'POST',headers,data:{topic:'*',url:'https://example.test/default'}});assert.equal(defaults.status,201);assert.match(defaults.body.secret,/^whsec_/);assert.equal(defaults.body.active,1);
+ assert.equal((await call('/api/webhooks',{method:'POST',headers,data:{topic:'*',url:'javascript:bad'}})).status,400);
+});
 
 test('global IDs and bounded GraphQL syntax',()=>{
  assert.equal(encodeGid('Client',1),'Z2lkOi8vam9iYmVyL0NsaWVudC8x');for(const id of [1,'1','gid://jobber/Client/1',encodeGid('Client',1)])assert.equal(decodeGid(id,'Client'),1);
@@ -124,7 +200,7 @@ test('Astra 1: partial monetary edits inherit fixed types',async t=>{
  }
 });
 
-test('Astra 2: invalid nested selections fail before any mutation',async t=>{
+test('Astra 2: invalid nested selections reject before any mutation',async t=>{
  const {gql,r}=await fixture(t),before=r.list('clients').length;
  const bad=['doesNotExist','client{doesNotExist}','client','client{id{bad}}','userErrors{doesNotExist}','... on ClientCreatePayload {doesNotExist}','...Bad','client{properties{edges{node{address{bad}}}}}','client{jobs{nodes{jobCosting{bad}}}}','client{quotes{nodes{amounts{bad}}}}','client{invoices{nodes{lineItems{nodes{bad}}}}}','client{phones{bad}}','client{emails{bad}}','client{billingAddress{bad}}','client{properties{pageInfo{bad}}}','client{requests{nodes{assessment{bad}}}}','client{jobs{nodes{visits{nodes{assignedUsers{nodes{name{bad}}}}}}}}'];
  for(const selection of bad){const result=await gql(`mutation{first:clientCreate(input:{name:"Must not insert"}){client{id}} second:clientCreate(input:{name:"Invalid"}){${selection}}} fragment Bad on ClientCreatePayload {doesNotExist}`);assert.ok(result.errors,selection);assert.equal(result.data,null);assert.equal(r.list('clients').length,before);}
@@ -132,7 +208,7 @@ test('Astra 2: invalid nested selections fail before any mutation',async t=>{
  for(const query of ['{__schema{types{fields{bad}}}}','{__schema{directives{bad}}}','{__type(name:"Client"){bad}}','{node(id:1){bad}}','{scheduledItems{nodes{bad}}}','{currentUser{email{bad}}}'])assert.ok((await gql(query)).errors,query);
 });
 
-test('Astra 3: execution budgets abort traversal immediately',async t=>{
+test('Astra 3: execution budgets stop traversal immediately',async t=>{
  const {gql,r}=await fixture(t);for(let i=0;i<850;i++)r.insert('clients',{display_name:'Budget '+i});
  const wide=await gql(`{clients(first:1000){nodes{${Array.from({length:25},(_,i)=>`n${i}:name`).join(' ')}}} account{id}}`);
  assert.equal(wide.data,null);assert.deepEqual(wide.errors,[{message:'Execution cost exceeded'}]);assert.equal(wide.extensions.cost.actualQueryCost,20001);
@@ -170,7 +246,7 @@ test('Astra 6: full grant stores permit consumption and refresh rotation',async 
  assert.ok(codeAuth.exchange({grant_type:'authorization_code',client_id:'test',code:consumable}).access_token);
 });
 
-test('Astra 7: issuance failures preserve code, refresh and previous session',async t=>{
+test('Astra 7: issuance errors preserve code, refresh and previous session',async t=>{
  const {db,headers}=await fixture(t),auth=createAuth(db),code=auth.authorize({headers},{response_type:'code',client_id:'test'}).code;
  db.exec("CREATE TEMP TABLE issuance_failure(enabled INTEGER); INSERT INTO issuance_failure VALUES(1); CREATE TEMP TRIGGER fail_issuance BEFORE INSERT ON sessions WHEN (SELECT enabled FROM issuance_failure)=1 BEGIN SELECT RAISE(ABORT,'forced issuance failure'); END;");
  const input={grant_type:'authorization_code',client_id:'test',code};assert.throws(()=>auth.exchange(input),/forced issuance failure/);
@@ -279,7 +355,7 @@ test('Astra 21: write-only payloads succeed and selected entities require read b
  const deleted=await gql(`mutation{propertyDelete(input:{id:${p.legacyId}}){deletedId userErrors{message}}}`);assert.equal(deleted.errors,undefined);assert.deepEqual(deleted.data.propertyDelete,{deletedId:p.id,userErrors:[]});assert.throws(()=>r.get('properties',p.legacyId));
 });
 
-test('Astra 22: impossible and unknown fragments fail before any mutation',async t=>{
+test('Astra 22: impossible and unknown fragments reject before any mutation',async t=>{
  const {gql,r}=await fixture(t),before=r.list('clients').length;
  for(const [selection,fragment] of [['... on Node{id}',''],['...Bad','fragment Bad on Node{id}'],['... on Missing{__typename}',''],['...Bad','fragment Bad on Missing{__typename}'],['client{... on Invoice{id}}',''],['client{...Bad}','fragment Bad on Invoice{id}'],['... on Query{__typename}',''],['... on PageInfo{__typename}','']]){const result=await gql(`mutation{first:clientCreate(input:{name:"No write"}){userErrors{message}} second:clientCreate(input:{name:"Invalid"}){${selection}}} ${fragment}`);assert.equal(result.data,null);assert.match(result.errors[0].message,/cannot spread|Unknown type/);assert.equal(r.list('clients').length,before);}
  const valid=await gql('{clients(first:1){nodes{... on Node{id}}} scheduledItems(first:1000){nodes{... on Node{id} ... on ScheduledItem{__typename}}}}');assert.equal(valid.errors,undefined,JSON.stringify(valid));assert.ok(valid.data.clients.nodes[0].id);
@@ -719,7 +795,7 @@ test('Astra 70: quote-backed edits inherit pricing and invoice the edited quote 
  }
 });
 
-test('Astra 71: invalid job lines fail atomically and valid catalog lines remain invoiceable',async t=>{
+test('Astra 71: invalid job lines reject atomically and valid catalog lines remain invoiceable',async t=>{
  const {mutate,gql,r,db,call,headers}=await fixture(t),clientId=r.list('clients')[0].id,job=await mutate('jobCreate',{clientId,title:'Valid lines',lineItems:[{name:'Original',unitPrice:10}]},'job');
  const before=r.get('jobs',job.legacyId),prefs=()=>db.prepare('SELECT name,value_json FROM preferences WHERE organization_id=1 ORDER BY name').all(),previous=prefs(),count=r.list('jobs').length;
  const foreign=r.list('products_services')[0];db.prepare('INSERT INTO products_services(organization_id,name) VALUES(2,?)').run('Foreign service');const foreignId=db.prepare('SELECT id FROM products_services WHERE organization_id=2 AND name=?').get('Foreign service').id;
@@ -1086,7 +1162,7 @@ test('Astra 98: sequence exhaustion rejects atomically and ignores corrupt seque
  const rejected=await call('/api/jobs',{method:'POST',headers,data:{client_id:clientId,title:'Exhausted',items:[line]}});assert.equal(rejected.status,400);assert.deepEqual(snapshot(),exhausted);
 });
 
-test('Astra 99: failed tax reconciliation rolls back durable sequence exhaustion',async t=>{
+test('Astra 99: rejected tax reconciliation rolls back durable sequence exhaustion',async t=>{
  const {db,r,call,headers}=await fixture(t),job=r.insert('jobs',{client_id:r.list('clients')[0].id,title:'Rollback allocator'}),max=Number.MAX_SAFE_INTEGER;
  storeJobOptions(db,1,job.id,{tax_rate:100});
  const seq=await call('/api/preferences',{method:'POST',headers,data:{name:'job_line_seq',value_json:String(max-1)}});assert.equal(seq.status,201);
