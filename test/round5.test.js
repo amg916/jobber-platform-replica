@@ -1382,4 +1382,10 @@ test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, com
  assert.match(await h.run("receptionistTab='Manage';receptionist()"),/Get started with Receptionist/);
  assert.match(await h.run("marketingTab='Website';marketing()"),/If you have a minute, we have your website/);
  assert.match(await h.run("marketingTab='Performance';marketing()"),/Your marketing performance/);
+ assert.match(await h.run("appsTab='Featured';apps()"),/The Home Depot[\s\S]*Claude Connector[\s\S]*SendJim/);
+ assert.match(await h.run("reportPage('Projected income')"),/View Aged Receivables Report/);
+ assert.match(await h.run("settings('automations')"),/Auto-archive Quotes/);
+ await h.run("builder('clients')");assert.match(h.elements.get('#overlay').innerHTML,/Lead source/);
+ await h.run("builder('quotes')");assert.match(h.elements.get('#overlay').innerHTML,/Contract \/ Disclaimer/);
+ await h.run("detail('clients',1)");assert.match(h.elements.get('#overlay').innerHTML,/Work overview[\s\S]*All your client files in one place/);
 });

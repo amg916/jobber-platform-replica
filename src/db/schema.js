@@ -42,7 +42,7 @@ export const definitions = {
  automation_executions: 'organization_id! automation_id! trigger_event entity_type entity_id idempotency_key! status=queued|running|succeeded|failed|skipped attempt_count$ max_attempts$ scheduled_for! executed_at result_json error_message created_at',
  attachments: 'organization_id! entity_type! entity_id! file_name! file_type file_size_bytes$ content_text uploaded_by_user_id created_at',
  activity_logs: 'organization_id! actor_user_id actor_name client_id entity_type entity_id action summary metadata_json created_at',
- integration_connections: 'organization_id! provider=quickbooks_online|stripe_payments|twilio_sms|sendgrid_email|google_calendar|companycam|mailchimp|zapier|openai_receptionist|servicetitan display_name category status=connected_sandbox|connected_live|disconnected config_json last_sync_at created_at',
+ integration_connections: 'organization_id! provider=quickbooks_online|stripe_payments|twilio_sms|sendgrid_email|google_calendar|companycam|mailchimp|zapier|openai_receptionist|servicetitan|home_depot|chatgpt|claude|gusto|nicejob|wisr_ai|voicepro|rilla|wrenchers|hover|fraction|linear_feet|my_service_area|responsibid|sendjim display_name category status=connected_sandbox|connected_live|disconnected config_json last_sync_at created_at',
  online_bookings: 'organization_id! client_id! request_id job_id service_id service_name customer_name customer_email customer_phone address requested_date requested_slot assigned_user_id status=confirmed|rescheduled|cancelled confirmation_code! created_at',
  ai_receptionist_logs: 'organization_id! caller_name caller_phone client_id request_id transcript intent summary action_taken status=handled|escalated|voicemail duration_seconds$ created_at'
 };
