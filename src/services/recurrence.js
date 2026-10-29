@@ -1,6 +1,18 @@
 import { fail, transaction } from '../db/database.js';
 export function teamIds(repo, ids=[]) { if(typeof ids==='string') { try { ids=JSON.parse(ids); } catch { fail('Invalid team'); } } if(!Array.isArray(ids)) fail('Expected team array'); ids=[...new Set(ids)]; for(const id of ids) { if(!Number.isSafeInteger(id)||!repo.get('users',id).is_active) fail('Inactive team member'); } return [...new Set(ids)]; }
 export function interval(start,end) { const a=Date.parse(start),b=Date.parse(end); if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a) fail('Invalid schedule interval'); return [new Date(a).toISOString(),new Date(b).toISOString()]; }
+export function zonedIso(dateStr,timeStr,timeZone='UTC'){
+ const rawTime=String(timeStr||'').trim();
+ if(rawTime.includes('T')){const ms=Date.parse(rawTime);if(!Number.isFinite(ms))fail('Invalid schedule interval');return new Date(ms).toISOString();}
+ const dm=String(dateStr||'').match(/^(\d{4})-(\d{2})-(\d{2})$/),tm=rawTime.match(/^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$/);
+ if(!dm||!tm)fail('Invalid schedule interval');
+ const [,Y,M,D]=dm.map(Number),h=Number(tm[1]),m=Number(tm[2]),s=tm[3]===undefined?0:Number(tm[3]),msPart=tm[4]===undefined?0:Number(tm[4].slice(0,3).padEnd(3,'0'));
+ const check=new Date(Date.UTC(Y,M-1,D,h,m,s,msPart));
+ if(check.getUTCFullYear()!==Y||check.getUTCMonth()!==M-1||check.getUTCDate()!==D||h>23||m>59||s>59)fail('Invalid schedule interval');
+ let fmt;try{fmt=new Intl.DateTimeFormat('en-CA',{timeZone:timeZone||'UTC',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});}catch{fmt=new Intl.DateTimeFormat('en-CA',{timeZone:'UTC',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});}
+ const wallMs=Date.UTC(Y,M-1,D,h,m,s,msPart),offsetAt=ms=>{const p=Object.fromEntries(fmt.formatToParts(new Date(ms)).map(x=>[x.type,x.value]));return Date.UTC(Number(p.year),Number(p.month)-1,Number(p.day),Number(p.hour)%24,Number(p.minute),Number(p.second))-Math.floor(ms/1000)*1000;};
+ let guess=wallMs-offsetAt(wallMs);guess=wallMs-offsetAt(guess);return new Date(guess).toISOString();
+}
 export function conflicts(repo,start,end,ids,exclude={}) {
  [start,end]=interval(start,end); const team=new Set(teamIds(repo,ids));
  return repo.list('appointments').filter(a=>a.status!=='cancelled' && !(a.entity_type===exclude.entity_type && a.entity_id===exclude.entity_id) && a.start_at<end && a.end_at>start && JSON.parse(a.assigned_user_ids_json||'[]').some(id=>team.has(id)));

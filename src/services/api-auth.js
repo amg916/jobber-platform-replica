@@ -16,6 +16,7 @@ export function createAuth(db,{oauthClients={}}={}){
  return {
   throttle,
   revoke(token){for(const [key,value] of refresh)if(value.access===token)refresh.delete(key);},
+  revokeOrg(orgId,exceptAccess=null){sweep(codes);sweep(refresh);const revoked=new Set();for(const [key,value] of refresh)if(value.org===orgId&&value.access!==exceptAccess){revoked.add(value.access);refresh.delete(key);}for(const [key,value] of codes)if(value.org===orgId)codes.delete(key);return revoked;},
   csrf(t){return createHmac('sha256',secret).update(t||'public').digest('hex');},
   verifyOrigin(req){
    if(req.headers['sec-fetch-site']&&!['same-origin','none'].includes(req.headers['sec-fetch-site']))fail('Invalid request origin',403);

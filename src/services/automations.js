@@ -68,7 +68,7 @@ function execute(repo,run,rule) {
   case 'create_task': case 'schedule_followup': return repo.insert('tasks',{client_id:clientId,job_id:run.entity_type==='jobs'?entity.id:null,title:config.title||rule.name,instructions:config.instructions||'',due_date:config.due_date||new Date().toISOString().slice(0,10),assigned_user_id:config.assigned_user_id||null});
   case 'notify_team_member': return repo.insert('notifications',{user_id:config.user_id||null,title:config.title||rule.name,body:config.body||'',entity_type:run.entity_type,entity_id:entity.id});
   case 'change_status': case 'update_record': {
-   const allowed={clients:['status','notes'],requests:['status','internal_notes'],jobs:['status','internal_notes'],tasks:['status','instructions']};
+   const allowed={clients:['status','notes'],requests:['status','internal_notes'],quotes:['status','internal_notes'],jobs:['status','internal_notes'],tasks:['status','instructions']};
    const patch=rule.action_type==='change_status'?{status:config.status}:config.fields;
    if(!patch || Object.keys(patch).some(k=>!allowed[run.entity_type]?.includes(k))) fail('Automation update not permitted');
    return repo.update(run.entity_type,entity.id,patch);

@@ -28,7 +28,7 @@ export function reconcile(repo,clientId) {
   const allocations=repo.list('payment_allocations',{invoice_id:invoice.id}).reduce((s,a)=>s+a.amount_cents,0);
   const refunds=repo.list('refunds',{invoice_id:invoice.id}).reduce((s,r)=>s+r.amount_cents,0);
   const amount_paid_cents=allocations-refunds;
-  const balance_due_cents=Math.max(0,invoice.total_cents-amount_paid_cents);
+  const balance_due_cents=invoice.status==='void'?0:Math.max(0,invoice.total_cents-amount_paid_cents);
   const status=['draft','void','bad_debt'].includes(invoice.status)?invoice.status:balance_due_cents===0?'paid':amount_paid_cents>0?'partial':invoice.due_date && invoice.due_date<new Date().toISOString().slice(0,10)?'past_due':'awaiting_payment';
   if(invoice.amount_paid_cents!==amount_paid_cents||invoice.balance_due_cents!==balance_due_cents||invoice.status!==status) repo.update('invoices',invoice.id,{amount_paid_cents,balance_due_cents,status,paid_at:status==='paid'?invoice.paid_at||new Date().toISOString():null});
  }
