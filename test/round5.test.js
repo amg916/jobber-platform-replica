@@ -1402,4 +1402,7 @@ test('live Chrome 1:1 page parity: insights, custom-reports, refer-and-earn, com
  await h.run("builder(\"clients\")");assert.match(h.elements.get("#overlay").innerHTML,/No tax rate created/);
  await h.run("builder(\"requests\")");assert.match(h.elements.get("#overlay").innerHTML,/Please provide as much information as you can/);
  await h.run("builder(\"jobs\")");assert.match(h.elements.get("#overlay").innerHTML,/Remind me to invoice when I close the job/);
+ const repsIndex=h.run("reports()");
+ for(const text of ["Tax totals, total awaiting collection","Conversion rate information for each salesperson","Reports Basics"])assert.match(repsIndex,new RegExp(text));
+ assert.match(h.run("communityPage()"),/CUSTOMER SERVICE & EXPERIENCE[\s\S]*SOCIAL MEDIA MARKETING/);
 });
