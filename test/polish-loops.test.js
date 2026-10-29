@@ -5,6 +5,10 @@ import { createContext, runInContext } from 'node:vm';
 import { createDatabase, repository } from '../src/db/database.js';
 import { migrate } from '../src/db/schema.js';
 import { seedDatabase } from '../src/db/seed.js';
+import { workflows } from '../src/services/workflows.js';
+import { emit, runPending } from '../src/services/automations.js';
+import { checkAvailability } from '../src/services/availability.js';
+import { startServer } from '../src/server.js';
 
 const appSource = readFileSync(new URL('../src/public/app.js', import.meta.url), 'utf8');
 const parityCss = readFileSync(new URL('../src/public/parity.css', import.meta.url), 'utf8');
@@ -884,4 +888,586 @@ test('T14 audit fixes: monthly goal scopes to current month, Plus Monthly radio 
   assert.equal(target.disabled, false);
   assert.equal(h.run('window.details'), 1);
   assert.equal(h.run('window.errors.at(-1)'), 'Save failed');
+});
+
+function t15Fixture(t) {
+  const db = createDatabase();
+  seedDatabase(db);
+  db.exec('PRAGMA ignore_check_constraints=ON');
+  t.after(() => db.close());
+  return workflows(db, 1, 1);
+}
+
+test('Astra opening invoice identity preserves manual and job invoices with the same title', t => {
+  const w=t15Fixture(t);
+  for(const linked of [false,true]){
+    const c=w.createClient({display_name:'Identity'}),job=linked?w.createJob({client_id:c.id,title:'Work'}):null;
+    const inv=w.createInvoice({client_id:c.id,job_id:job?.id||null,subject:'Initial balance'},[{name:'Original work',quantity:1,unit_price_cents:12500,taxable:0}]);
+    w.issueInvoice(inv.id,'upon_receipt');const items=w.r.list('invoice_line_items',{invoice_id:inv.id});
+    assert.equal(w.setInitialBalance(c.id,5000).balance_cents,17500);
+    assert.equal(w.initialBalanceCents(c.id),5000);
+    assert.equal(w.r.get('invoices',inv.id).total_cents,12500);
+    assert.deepEqual(w.r.list('invoice_line_items',{invoice_id:inv.id}),items);
+  }
+  const c=w.createClient({display_name:'Unchanged'});w.setInitialBalance(c.id,5000);
+  const inv=w.createInvoice({client_id:c.id,subject:'Other work'},[{name:'Other work',quantity:1,unit_price_cents:3000,taxable:0}]);w.issueInvoice(inv.id,'upon_receipt');
+  assert.equal(w.setInitialBalance(c.id,5000).balance_cents,8000);
+});
+
+test('Astra campaign filters reject corrupt values and accept explicit empty filters', t => {
+  const w=t15Fixture(t),c=w.createClient({display_name:'Eligible',email:'eligible@example.test',receives_marketing:1,receives_email:1});
+  for(const raw of ['null','{','[]',123,'{}','',null,{}]){
+    const campaign=w.r.insert('campaigns',{name:'Filter',channel:'email',subject:'Hello',body:'Hello',segment_filter_json:raw});
+    if(['null','{','[]',123].includes(raw)){assert.throws(()=>w.sendCampaign(campaign.id),e=>e.status===400&&e.message==='Invalid campaign segment filter');assert.equal(w.r.list('messages',{related_entity_type:'campaigns',related_entity_id:campaign.id}).length,0);}
+    else {assert.equal(w.sendCampaign(campaign.id).status,'sent');assert.ok(w.r.list('messages',{client_id:c.id,related_entity_id:campaign.id}).length);}
+  }
+});
+
+test('Astra opening balance prefill uses total or preference, never aggregate debt', async () => {
+  for(const opening of [0,5000])for(const fallback of [false,true]){
+    const h=loopHarness({'invoices/9':{id:9,total_cents:opening,status:'awaiting_payment'}},opening?{'initial_balance_invoice:1':{invoice_id:9}}:{});
+    await h.run(`recordDetailAction('clients',${JSON.stringify({id:1,balance_cents:opening+3000,...(fallback?{}:{initial_balance_cents:opening})})},'Set initial balance')`);
+    assert.match(h.elements.get('#overlay').innerHTML,new RegExp('name="balance"[^>]*value="'+opening/100+'"'));
+    await loopSubmit(h,{balance:String(opening/100)});assert.equal(h.writes[0].body.balance_cents,opening);
+  }
+});
+
+test('Astra builder prevents submit while custom fields load and retains original client baseline', async () => {
+  const h=loopHarness({'clients/1':{id:1,first_name:'John',last_name:'Smith',display_name:'John Smith'}});
+  const form=h.elements.get('#builder');form.values={first_name:'Jane',last_name:'Smith',display_name:'John Smith'};
+  h.run("window.draft=captureClientBuilderDraft(document.querySelector('#builder'),{id:1,first_name:'John',last_name:'Smith',display_name:'John Smith'});window.realFetch=fetch;fetch=async(path,...args)=>path==='/api/custom-fields'?new Promise(resolve=>window.releaseFields=()=>resolve({ok:true,status:200,json:async()=>[]})):window.realFetch(path,...args);");
+  h.elements.set('#client-custom-fields',h.makeEl());
+  const pending=h.run("builder('clients',1,window.draft)");
+  for(let i=0;i<20&&!h.run('Boolean(window.releaseFields)');i++)await Promise.resolve();
+  assert.equal(typeof form.onsubmit,'function');let prevented=false;
+  const save=form.onsubmit({currentTarget:form,preventDefault(){prevented=true;}});
+  assert.equal(prevented,true);assert.equal(h.writes.length,0);
+  h.run('window.releaseFields()');await pending;await save;
+  assert.equal(h.writes.find(w=>w.key==='clients/1').body.display_name,'Jane Smith');
+});
+
+test('Astra numeric custom fields allow fractions in both editors and mobile header shrinks', async () => {
+  const h=loopHarness({'custom-fields':[{id:7,entity_type:'clients',field_name:'Numeric',field_type:'number',default_value:'1.5'}]});
+  const host=h.makeEl();h.elements.set('#client-custom-fields',host);
+  await h.run('bindClientEditor(null,{})');assert.match(host.innerHTML,/type="number" step="any"/);
+  assert.match(await h.run("entitySections('clients',1)"),/type="number" step="any"/);
+  assert.match(parityCss,/#breadcrumb:not\(:empty\) \{ display: none; \}/);
+  assert.match(parityCss,/width: 34px; height: 34px; min-height: 34px; padding: 5px/);
+});
+
+test('Merged opening balances preserve identity, payments, custom fields and tags', async t => {
+  const db=createDatabase();seedDatabase(db);
+  const server=await startServer({db,seed:false,port:0,allowDemoSwitch:true});
+  t.after(async()=>{await server.close();db.close();});
+  const session=await (await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json();
+  const headers={Authorization:'Bearer '+session.token,'Content-Type':'application/json'},w=workflows(db,1,1),r=w.r;
+  const request=async(path,method,body)=>{const res=await fetch(server.url+'/api/'+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});return {status:res.status,body:await res.json()};};
+  for(const [targetAmount,sourcePaid,targetPaid] of [[0,0,0],[3000,0,0],[3000,1000,0],[3000,0,1000],[3000,1000,500]]){
+    const source=w.createClient({display_name:'Merge source'}),target=w.createClient({display_name:'Merge target'});
+    w.setInitialBalance(source.id,5000);w.setInitialBalance(target.id,targetAmount);
+    const original=r.list('invoices',{client_id:source.id}).concat(r.list('invoices',{client_id:target.id}));
+    for(const [client,paid] of [[source,sourcePaid],[target,targetPaid]])if(paid)w.recordPayment({client_id:client.id,invoice_id:original.find(i=>i.client_id===client.id).id,amount_cents:paid,method:'cash'});
+    const field=r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Merge field',field_key:'merge_'+source.id,field_type:'text'}),tag=r.insert('tags',{name:'Merge '+source.id});
+    for(const client of [target,source]){r.insert('custom_field_values',{field_definition_id:field.id,entity_type:'clients',entity_id:client.id,value_text:client===target?'':'Source value'});r.insert('entity_tags',{tag_id:tag.id,entity_type:'clients',entity_id:client.id});}
+    const merged=await request('clients/merge','POST',{source_id:source.id,target_id:target.id});
+    assert.equal(merged.status,200);assert.equal(merged.body.initial_balance_cents,5000+targetAmount);
+    assert.equal(merged.body.balance_cents,5000+targetAmount-sourcePaid-targetPaid);
+    assert.equal(w.initialBalanceCents(source.id),0);
+    assert.equal(r.list('preferences',{name:'initial_balance_invoice:'+source.id}).length,0);
+    assert.deepEqual(r.list('custom_field_values',{entity_type:'clients',entity_id:target.id}).map(x=>x.value_text),['Source value']);
+    assert.equal(r.list('entity_tags',{entity_type:'clients',entity_id:target.id}).length,1);
+    const updated=await request(`clients/${target.id}/initial-balance`,'POST',{balance_cents:5000});
+    assert.equal(updated.status,200);assert.equal(updated.body.initial_balance_cents,5000);assert.equal(updated.body.balance_cents,5000-sourcePaid-targetPaid);
+    assert.equal(r.list('invoices',{client_id:target.id}).length,original.length);
+    const cleared=await request(`clients/${target.id}/initial-balance`,'POST',{balance_cents:0});
+    assert.equal(cleared.status,sourcePaid+targetPaid?409:200);
+    if(!sourcePaid&&!targetPaid)assert.equal(cleared.body.balance_cents,0);
+    else {assert.equal(w.initialBalanceCents(target.id),5000);assert.throws(()=>w.setInitialBalance(target.id,sourcePaid+targetPaid-1),e=>e.status===409);assert.equal(w.setInitialBalance(target.id,sourcePaid+targetPaid).balance_cents,0);}
+  }
+  for(const sourceValue of ['Populated source','ABC','']){
+    const source=w.createClient({display_name:'Null merge source'}),target=w.createClient({display_name:'Null merge target'});
+    const field=r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Nullable',field_key:'nullable_'+source.id,field_type:'text',default_value:'ABC'});
+    r.insert('custom_field_values',{field_definition_id:field.id,entity_type:'clients',entity_id:target.id,value_text:null});
+    r.insert('custom_field_values',{field_definition_id:field.id,entity_type:'clients',entity_id:source.id,value_text:sourceValue});
+    assert.equal((await request('clients/merge','POST',{source_id:source.id,target_id:target.id})).status,200);
+    assert.deepEqual(r.list('custom_field_values',{entity_type:'clients',entity_id:target.id}).map(x=>x.value_text),[sourceValue]);
+    assert.equal(r.list('custom_field_values',{entity_type:'clients',entity_id:source.id}).length,0);
+  }
+  const defSrc=w.createClient({display_name:'Default src'}),defTgt=w.createClient({display_name:'Default tgt'}),defField=r.insert('custom_field_definitions',{entity_type:'clients',field_name:'Default code',field_key:'def_code',field_type:'text',default_value:'ABC'});
+  r.insert('custom_field_values',{field_definition_id:defField.id,entity_type:'clients',entity_id:defTgt.id,value_text:''});
+  r.insert('custom_field_values',{field_definition_id:defField.id,entity_type:'clients',entity_id:defSrc.id,value_text:'ABC'});
+  assert.equal((await request('clients/merge','POST',{source_id:defSrc.id,target_id:defTgt.id})).status,200);
+  assert.deepEqual(r.list('custom_field_values',{entity_type:'clients',entity_id:defTgt.id,field_definition_id:defField.id}).map(x=>x.value_text),['']);
+  const c=w.createClient({display_name:'Draft identities'}),drafts=[1,2].map(()=>w.createInvoice({client_id:c.id,subject:'Initial balance'},[{name:'Initial balance',quantity:1,unit_price_cents:1000}]));
+  for(const inv of drafts)r.insert('preferences',{name:'initial_balance_invoice:'+c.id,value_json:JSON.stringify({invoice_id:inv.id,invoice_ids:[inv.id,inv.id,-1,null]})});
+  assert.equal(w.initialBalanceCents(c.id),2000);
+  assert.equal((await request('invoices/'+drafts[0].id,'DELETE')).status,200);
+  const prefs=r.list('preferences',{name:'initial_balance_invoice:'+c.id});assert.equal(prefs.length,1);assert.deepEqual(JSON.parse(prefs[0].value_json).invoice_ids,[drafts[1].id]);
+  assert.equal(w.setInitialBalance(c.id,0).balance_cents,0);assert.equal(r.list('invoices',{client_id:c.id}).length,0);
+});
+
+test('T15 initial balance: create, resize, clear and count applied deposits only once', t => {
+  const w = t15Fixture(t), c = w.createClient({ display_name: 'Opening balance' });
+  for (const amount of [5000, 8000, 3000]) assert.equal(w.setInitialBalance(c.id, amount).balance_cents, amount);
+  const inv = w.r.list('invoices', { client_id: c.id })[0];
+  assert.equal(w.r.list('invoices', { client_id: c.id }).length, 1);
+  assert.equal(w.setInitialBalance(c.id, 0).balance_cents, 0);
+  assert.equal(w.r.get('invoices', inv.id).status, 'void');
+  assert.throws(() => w.setInitialBalance(c.id, -1), e => e.status === 400);
+  w.setInitialBalance(c.id, 5000);
+  const next = w.r.list('invoices', { client_id: c.id }).find(i => i.status !== 'void');
+  const payment = w.recordPayment({ client_id: c.id, amount_cents: 2000, payment_type: 'deposit', method: 'cash' });
+  w.applyDeposit(next.id, payment.id, 2000);
+  assert.equal(w.r.get('invoices', next.id).amount_paid_cents, 2000);
+  assert.equal(w.setInitialBalance(c.id, 3000).balance_cents, 1000);
+  assert.equal(w.r.get('invoices', next.id).balance_due_cents, 1000);
+  for (const amount of [1999, 0]) assert.throws(() => w.setInitialBalance(c.id, amount), e => e.status === 409);
+  assert.equal(w.r.get('invoices', next.id).total_cents, 3000);
+  assert.equal(w.setInitialBalance(c.id, 2000).balance_cents, 0);
+});
+
+test('Batch initial balances match individual serialization on all client list routes',async t=>{
+  const db=createDatabase();seedDatabase(db);const w=workflows(db,1,1),r=w.r;
+  const a=w.createClient({display_name:'Batch A',email:'batch@example.test'}),b=w.createClient({display_name:'Batch B',email:'batch@example.test'}),zero=w.createClient({display_name:'Batch Zero',email:'batch@example.test'});
+  const invoice=(client,status='draft',extra={})=>r.insert('invoices',{client_id:client.id,subject:'Balance',status,total_cents:100,...extra});
+  const good=Array.from({length:501},()=>invoice(a)),other=invoice(b),bad=[invoice(a,'void'),invoice(a,'bad_debt'),invoice(a,'draft',{job_id:r.insert('jobs',{client_id:a.id,title:'Linked'}).id}),invoice(a,'draft',{quote_id:r.insert('quotes',{client_id:a.id,title:'Linked'}).id})];
+  const pref=(suffix,ids)=>r.insert('preferences',{name:'initial_balance_invoice:'+suffix,value_json:JSON.stringify({invoice_id:ids[0],invoice_ids:ids})});
+  pref(a.id,[...good,...bad,other].map(i=>i.id));pref(a.id,[good[0].id]);pref(b.id,[other.id,good[0].id]);pref('0'+zero.id,[invoice(zero).id]);pref('9007199254740992',[other.id]);pref(zero.id,[]);
+  const map=w.initialBalanceMap();assert.equal(map.get(a.id),50100);assert.equal(map.get(b.id),100);assert.equal(map.get(zero.id),0);
+  for(const c of r.list('clients'))assert.equal(map.get(c.id)||0,w.initialBalanceCents(c.id));
+  const server=await startServer({db,seed:false,port:0,allowDemoSwitch:true});t.after(async()=>{await server.close();db.close();});
+  const session=await(await fetch(server.url+'/api/auth/bootstrap',{method:'POST'})).json(),headers={Authorization:'Bearer '+session.token};
+  for(const path of ['clients','clients/duplicates?email=batch@example.test','clients/export']){
+    const res=await fetch(server.url+'/api/'+path,{headers});assert.equal(res.status,200);
+    if(path.endsWith('export')){const lines=(await res.text()).trim().split(/\r?\n/),parse=line=>[...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)].map(m=>m[1].replaceAll('""','"')),columns=parse(lines.shift()),idIndex=columns.indexOf('id'),balanceIndex=columns.indexOf('initial_balance_cents');assert.ok(balanceIndex>=0);for(const c of [a,b,zero]){const fields=lines.map(parse).find(f=>Number(f[idIndex])===c.id);assert.equal(Number(fields[balanceIndex]),map.get(c.id));}}
+    else {const list=await res.json();for(const c of [a,b,zero])assert.equal(list.find(x=>x.id===c.id).initial_balance_cents,map.get(c.id));}
+  }
+});
+
+test('Batch client serialization with 2000 unrelated preferences stays below 150ms',t=>{
+  const db=createDatabase();seedDatabase(db);t.after(()=>db.close());const w=workflows(db,1,1),r=w.r;
+  for(let i=0;i<2000;i++){r.insert('clients',{display_name:'Performance '+i});r.insert('preferences',{name:'job_lines:'+i,value_json:'[]'});}
+  const plan=db.prepare("EXPLAIN QUERY PLAN SELECT name,value_json FROM preferences WHERE organization_id=? AND name >= 'initial_balance_invoice:' AND name < 'initial_balance_invoice;' ORDER BY id ASC").all(1);assert.ok(plan.some(p=>p.detail.includes('preferences_org_name')));
+  const start=performance.now(),balances=w.initialBalanceMap(),rows=r.list('clients').map(c=>({...c,initial_balance_cents:balances.get(c.id)||0})),elapsed=performance.now()-start;
+  assert.ok(rows.length>=2000);assert.ok(elapsed<150,`Batch serialization took ${elapsed.toFixed(1)}ms`);t.diagnostic(`2000-client batch serialization: ${elapsed.toFixed(1)}ms`);
+});
+
+test('T15 HTTP initial balance and public booking tolerate corrupt business hours', async t => {
+  const db = createDatabase(); seedDatabase(db);
+  const server = await startServer({ db, seed: false, port: 0, allowDemoSwitch: true });
+  t.after(async () => { await server.close(); db.close(); });
+  const session = await (await fetch(server.url + '/api/auth/bootstrap', { method: 'POST' })).json();
+  const w = workflows(db, 1, 1), c = w.createClient({ display_name: 'HTTP balance' });
+  const post = async amount => {
+    const res = await fetch(server.url + `/api/clients/${c.id}/initial-balance`, { method: 'POST', headers: { Authorization: 'Bearer ' + session.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ balance_cents: amount }) });
+    return { status: res.status, body: await res.json() };
+  };
+  for (const amount of [5000, 8000, 3000, 0]) {
+    const res = await post(amount); assert.equal(res.status, 200); assert.equal(res.body.balance_cents, amount);
+  }
+  assert.equal(w.r.list('invoices', { client_id: c.id })[0].status, 'void');
+  assert.equal((await post(-1)).status, 400);
+  await post(5000);
+  const headers={Authorization:'Bearer '+session.token,'Content-Type':'application/json'};
+  const pref=w.r.list('preferences',{name:'initial_balance_invoice:'+c.id})[0];
+  for(const [path,method,payload] of [['preferences','POST',{name:pref.name,value_json:{invoice_id:999}}],['preferences/'+pref.id,'PATCH',{name:'renamed'}],['preferences/'+pref.id,'DELETE',{}]]){
+    const res=await fetch(server.url+'/api/'+path,{method,headers,body:JSON.stringify(payload)});assert.equal(res.status,403);
+  }
+  for(const path of ['clients/'+c.id,'clients/'+c.id+'/timeline']){
+    const res=await fetch(server.url+'/api/'+path,{headers});assert.equal(res.status,200);const output=await res.json();assert.equal((output.client||output).initial_balance_cents,5000);
+  }
+  const inv = w.r.list('invoices', { client_id: c.id }).find(i => i.status !== 'void');
+  const p = w.recordPayment({ client_id: c.id, payment_type: 'deposit', amount_cents: 2000, method: 'cash' });
+  w.applyDeposit(inv.id, p.id, 2000);
+  assert.equal((await post(3000)).body.balance_cents, 1000);
+  assert.equal((await post(1999)).status, 409);
+  assert.equal((await post(0)).status, 409);
+  const org = db.prepare('SELECT slug FROM organizations WHERE id=1').get();
+  db.exec('PRAGMA ignore_check_constraints=ON');
+  for (const raw of ['null', '{']) {
+    db.prepare('UPDATE organizations SET business_hours_json=? WHERE id=1').run(raw);
+    const res = await fetch(server.url + '/api/public/booking/' + org.slug);
+    assert.equal(res.status, 200); assert.deepEqual((await res.json()).hours, {});
+  }
+});
+
+test('T15 worker execution isolates corrupt conditions/config while emit rolls back webhooks', t => {
+  const w = t15Fixture(t), c = w.createClient({ display_name: 'Isolation', email: 'isolation@example.test', mobile_phone: '+15551234567', receives_email: 1, receives_sms: 1 });
+  const rules = ['null', '{', '{}'].map((raw, i) => w.r.insert('automations', { name: 'T15 rule ' + i, trigger_event: 'client_created', action_type: 'create_task', is_enabled: 1, conditions_json: '{}', action_config_json: raw }));
+  emit(w.r, 'client_created', 'clients', c.id, 't15');
+  w.r.update('automations', rules[0].id, { conditions_json: 'null' });
+  w.r.update('automations', rules[1].id, { conditions_json: '{' });
+  w.r.update('automations', rules[2].id, { action_config_json: '{' });
+  const results = runPending(w.r.db, new Date(Date.now() + 1000));
+  for (const rule of rules.slice(0, 2)) assert.equal(results.find(r => r.automation_id === rule.id).status, 'skipped');
+  assert.equal(results.find(r => r.automation_id === rules[2].id).status, 'queued');
+  assert.ok(results.find(r => r.automation_id === rules[2].id).error_message);
+  const invalid = ['{', 'null', '[]', '123'].flatMap(raw => ['send_email', 'send_sms', 'create_task'].map(action_type => w.r.insert('automations', { name: 'Invalid config', trigger_event: 'test_config', action_type, is_enabled: 1, conditions_json: '{}', action_config_json: raw })));
+  const healthy = w.r.insert('automations', { name: 'Healthy task', trigger_event: 'test_config', action_type: 'create_task', is_enabled: 1, conditions_json: '{}', action_config_json: '{}' });
+  const taskCount = w.r.list('tasks').length, messageCount = w.r.list('messages').length;
+  emit(w.r, 'test_config', 'clients', c.id, 'config');
+  const batch = runPending(w.r.db, new Date(Date.now() + 1000));
+  for (const rule of invalid) { const result = batch.find(r => r.automation_id === rule.id); assert.equal(result.status, 'queued'); assert.ok(result.error_message); }
+  assert.equal(batch.find(r => r.automation_id === healthy.id).status, 'succeeded');
+  assert.equal(w.r.list('messages').length, messageCount);
+  assert.equal(w.r.list('tasks').length, taskCount + 1);
+  const sub = w.r.insert('webhook_subscriptions', { topic: 'client_created', target_url: 'https://example.test/hook', secret: 'test', active: 1 });
+  assert.throws(() => emit(w.r, 'client_created', 'clients', c.id, 'rollback'), /Invalid automation conditions/);
+  assert.equal(w.r.get('webhook_subscriptions', sub.id).delivery_count, 0);
+  assert.equal(w.r.list('automation_executions', { idempotency_key: rules[2].id + ':rollback' }).length, 0);
+});
+
+test('T15 corrupt job lines, campaign filters and team availability do not crash workflows', t => {
+  const w = t15Fixture(t), c = w.createClient({ display_name: 'Corrupt preferences', email: 'test@example.test', receives_marketing: 1 });
+  for (const raw of ['null', '{', '{}']) {
+    const job = w.createJob({ client_id: c.id, title: 'Fallback job', status: 'requires_invoicing', subtotal_cents: 5000, total_cents: 5000 });
+    w.r.insert('preferences', { name: 'job_lines:' + job.id, value_json: raw });
+    assert.equal(w.invoiceJob(job.id).total_cents, 5000);
+    const campaign = w.r.insert('campaigns', { name: 'Fallback campaign', channel: 'email', subject: 'Hello', body: 'Welcome', segment_filter_json: raw });
+    if(raw==='{}')assert.equal(w.sendCampaign(campaign.id).status,'sent');else{assert.throws(()=>w.sendCampaign(campaign.id),e=>e.status===400);assert.equal(w.r.list('messages',{related_entity_type:'campaigns',related_entity_id:campaign.id}).length,0);}
+    w.r.db.prepare('UPDATE organizations SET timezone=?,business_hours_json=? WHERE id=1').run('UTC', '{"mon":["09:00","17:00"]}');
+    w.r.update('users', 1, { availability_json: raw });
+    assert.deepEqual(checkAvailability(w.r, { start_at: '2030-01-07T10:00:00Z', end_at: '2030-01-07T11:00:00Z', assigned_user_ids_json: [1] }).ids, [1]);
+  }
+});
+
+test('T15 initial balance frontend refreshes drawer, closes minimal harness and rejects stale saves', async () => {
+  for (const route of ['clients', 'clients/1', 'minimal', 'stale']) {
+    const h = loopHarness({ clients: [{ id: 1, balance_cents: 7500 }] });
+    h.run(`route=${JSON.stringify(route)}; window.details=[]; window.renders=0; render=async()=>{window.renders++;}; detail=async(...args)=>window.details.push(args);`);
+    if (route === 'minimal') h.elements.delete('#breadcrumb');
+    await h.run("recordDetailAction('clients',{id:1,balance_cents:8000,initial_balance_cents:5000},'Set initial balance')");
+    assert.match(h.elements.get('#overlay').innerHTML, /name="balance"[^>]*value="50"/);
+    if (route === 'stale') h.run("fetch=async()=>{++panelVersion;return {ok:true,status:200,json:async()=>[]};}");
+    await loopSubmit(h, { balance: '75' });
+    if (route === 'stale') { assert.equal(h.run('window.renders'), 0); continue; }
+    assert.deepEqual(h.writes[0], { key: 'clients/1/initial-balance', method: 'POST', body: { balance_cents: 7500 } });
+    assert.equal(h.run('clients[0].balance_cents'), 7500);
+    assert.equal(h.run('window.details.length'), route === 'clients' ? 1 : 0);
+    assert.equal(h.run('window.renders'), route === 'minimal' ? 0 : 1);
+    if (route === 'minimal') assert.equal(h.elements.get('#overlay').innerHTML, '');
+  }
+});
+
+for (const raw of ['null', '{', { format: 'Decimal hours', language: 'French' }]) test('T15 preference resilience: ' + JSON.stringify(raw), async () => {
+  const names = ['time-display', 'workspace-language', 'product-updates', 'rewards-claimed', 'review-response-test', 'referral-test'];
+  const h = loopHarness({ schedule: { appointments: [{ id: 1, entity_type: 'visit', assigned_user_ids_json: raw, start_at: '2030-01-07T10:00:00Z' }], unscheduled: [], properties: [] } }, Object.fromEntries(names.map(n => [n, raw])));
+  h.run("team=[{id:1,name:'Test user'}];");
+  assert.deepEqual(Array.from(h.run(`safeJsonArray(${JSON.stringify(raw)})`)), []);
+  assert.equal(h.run("typeof preferenceValue([{name:'x',value_json:" + JSON.stringify(raw) + "}],'x')"), 'object');
+  for (const tab of ['Timesheets', 'Approve timesheets', 'Confirm payroll']) assert.match(await h.run(`timesheetTab=${JSON.stringify(tab)};timesheets()`), /Timesheets/);
+  await h.run("globalPanel('settings')"); assert.match(h.elements.get('#overlay').innerHTML, /Language/);
+  for (const expression of ["gapAction('language')", "gapAction('rewards')", "growthAction('review-responses')"]) { await h.run(expression); assert.ok(h.elements.get('#overlay').innerHTML.length > 0); }
+  assert.match(await h.run('referAndEarnBase()'), /Invite a friend/);
+  assert.match(await h.run("schedFilter.team='1';schedule()"), /schedule-toolbar/);
+});
+
+test('T15 active dedicated phone switches Message Center from onboarding to conversations', async () => {
+  for (const active of [true, false]) {
+    const h = loopHarness({ messages: [{ client_id: 1, body: 'Hello', channel: 'sms' }] }, { dedicated_phone_number: { active, number: '+15551234567' } });
+    for (const sel of ['#message-search', '#message-channel', '#overlay [data-msg-filter]']) h.elements.set(sel, h.makeEl());
+    await h.run("globalPanel('messages')");
+    const html = h.elements.get('#overlay').innerHTML;
+    assert.equal(/id="message-onboarding" hidden/.test(html), active);
+    assert.equal(/id="live-conversations" hidden/.test(html), !active);
+    assert.equal(html.includes('id="message-active-number"'), active);
+    const markup = html.match(/<button data-live-conversations([^>]*)>([^<]*)<\/button>/);
+    assert.ok(markup);
+    assert.equal(/\bhidden\b/.test(markup[1]), active);
+    assert.match(markup[1], /data-count="1"/);
+    assert.ok(markup[1].includes(`aria-expanded="${active}"`));
+    assert.equal(markup[2], `${active ? 'Hide' : 'View'} Live Conversations (1)`);
+    const conv = h.makeEl(), onb = h.makeEl(), toggle = h.makeEl();
+    conv.hidden = !active; onb.hidden = active;
+    toggle.hidden = active; toggle.textContent = markup[2]; toggle.dataset.count = '1';
+    toggle.setAttribute('aria-expanded', String(active));
+    toggle.hasAttribute = name => name === 'data-live-conversations';
+    toggle.matches = () => false;
+    toggle.closest = selector => selector === '[data-close]' ? null : toggle;
+    h.elements.set('#live-conversations', conv);
+    h.elements.set('#message-onboarding', onb);
+    h.elements.set('[data-live-conversations]', toggle);
+    if (active) h.elements.set('#message-active-number', h.makeEl());
+    const click = () => h.listeners.click[0]({ target: toggle, preventDefault() {} });
+    const check = show => {
+      assert.equal(conv.hidden, !show);
+      assert.equal(onb.hidden, show);
+      assert.equal(toggle.hidden, active);
+      assert.equal(toggle['aria-expanded'], String(show));
+      assert.equal(toggle.textContent, `${show ? 'Hide' : 'View'} Live Conversations (1)`);
+    };
+    await click(); check(true);
+    await click(); check(active);
+    const filter = h.elements.get('#overlay [data-msg-filter]');
+    const unread = h.makeEl(), read = h.makeEl();
+    unread.dataset = { unread: 'true', conversation: 'client', channel: 'sms' };
+    read.dataset = { unread: 'false', conversation: 'client', channel: 'sms' };
+    h.queryAllMap.set('[data-conversation]', [unread, read]);
+    filter.value = 'unread'; filter.onchange(); check(true);
+    assert.equal(unread.hidden, false); assert.equal(read.hidden, true);
+    filter.value = 'all'; filter.onchange(); check(true);
+    assert.equal(read.hidden, false);
+    // Stale controls must tolerate a closed or replaced panel.
+    const search = h.elements.get('#message-search'), channel = h.elements.get('#message-channel');
+    for (const sel of ['#message-search', '#message-channel', '#live-conversations', '#message-onboarding', '[data-live-conversations]']) h.elements.delete(sel);
+    assert.doesNotThrow(() => { search.oninput(); channel.onchange(); filter.onchange(); });
+    await click();
+    await loopClick(h, {}, ['data-message-filter']);
+    assert.equal(h.elements.get('#toast').textContent, '');
+    await h.run("globalPanel('messages')");
+  }
+});
+
+test('T15 messages checks panel version before fetching preferences', async () => {
+  let release; const paths = [];
+  const h = createHarness(path => { paths.push(path); return new Promise(resolve => { release = () => resolve({ ok: true, json: async () => [] }); }); });
+  const pending = h.run("globalPanel('messages')");
+  assert.deepEqual(paths, ['/api/messages']);
+  h.run('close()'); release(); await pending;
+  assert.deepEqual(paths, ['/api/messages']); assert.equal(h.elements.get('#overlay').innerHTML, '');
+});
+
+test('T15 Client Builder custom field detour preserves draft, Back and custom values', async () => {
+  const h = loopHarness();
+  const form = h.elements.get('#builder');
+  form.values = { first_name: 'Draft', property_street1: '123 Main', contact_0_first_name: 'Alex', extra_email_0: 'extra@example.test', custom_field_7: 'Existing' };
+  form.querySelectorAll = () => [{ type: 'checkbox', name: 'receives_sms', checked: false }];
+  h.run("window.draft=captureClientBuilderDraft(document.querySelector('#builder'),{id:1});window.resumed=[];builder=async(...args)=>window.resumed.push(args);");
+  assert.equal(h.run('window.draft._primaryProperty.street1'), '123 Main');
+  assert.equal(h.run('window.draft._clientDraft.receives_sms'), '');
+  const action = h.elements.get('#action-form'); let appended = '';
+  action.insertAdjacentHTML = (_, html) => { appended += html; };
+  await h.run("customFieldEditor('clients',0,{id:1,draft:window.draft})");
+  assert.match(appended, /Back to Client/);
+  await loopClick(h, {}, ['data-client-cf-back']);
+  assert.equal(h.run('window.resumed[0][2]._clientDraft.contact_0_first_name'), 'Alex');
+  await h.run("customFieldEditor('clients',0,{id:1,draft:window.draft})");
+  await loopSubmit(h, { entity_type: 'clients', field_name: 'Gate code', field_type: 'text', default_value: '' });
+  assert.equal(h.writes[0].key, 'custom-fields');
+  assert.equal(h.run('window.resumed[1][2]._clientDraft.extra_email_0'), 'extra@example.test');
+  await h.run("saveClientExtras(1,{custom_field_7:'Existing',custom_field_8:'1234'},null,true)");
+  assert.deepEqual(h.writes.slice(-2).map(w => w.body), [7, 8].map((id, i) => ({ field_definition_id: id, entity_type: 'clients', entity_id: 1, value_text: i ? '1234' : 'Existing' })));
+  assert.match(h.run('clientEditorFields(window.draft)'), /\+ Add Custom Field/);
+});
+
+for(const returnVia of ['save','back'])test('Pending client save resumes Edit Client via '+returnVia, async () => {
+  let release;const writes=[],created={id:42,display_name:'Pending client'};
+  const h=createHarness(async(path,options={})=>{
+    const key=path.replace('/api/',''),method=options.method||'GET';let value=[];
+    if(method!=='GET')writes.push({key,method,body:JSON.parse(options.body)});
+    if(key==='clients'&&method==='POST')value=await new Promise(resolve=>{release=()=>resolve(created);});
+    else if(key==='clients')value=[created];
+    else if(key==='clients/42')value=created;
+    else if(key==='properties'&&method==='POST')value={id:100+writes.filter(w=>w.key==='properties').length};
+    else if(key==='custom-fields'&&method==='POST')value={id:7};
+    return {ok:true,status:200,json:async()=>value};
+  });
+  h.run('render=async()=>{};org={};');
+  await h.run("builder('clients')");
+  const form=h.elements.get('#builder');
+  form.values={first_name:'Pending client',property_street1:'123 Main',property_0_street1:'456 Other',contact_0_first_name:'Alex'};
+  const submit=()=>form.onsubmit({target:form,preventDefault(){}}),saving=submit();
+  await submit();assert.equal(writes.filter(w=>w.key==='clients').length,1);
+  const target=h.makeEl();target.hasAttribute=name=>name==='data-client-custom-field';target.matches=()=>false;
+  target.closest=selector=>selector==='[data-close]'?null:selector==='#builder'?form:target;
+  await h.listeners.click[0]({target,preventDefault(){}});
+  const resume=h.elements.get('#action-form').resumeClient;assert.ok(resume.pending);
+  const returning=returnVia==='back'?loopClick(h,{},['data-client-cf-back']):loopSubmit(h,{entity_type:'clients',field_name:'Code',field_type:'text',default_value:''});
+  await Promise.resolve();assert.doesNotMatch(h.elements.get('#overlay').innerHTML,/Edit Client/);
+  release();await saving;await returning;
+  assert.match(h.elements.get('#overlay').innerHTML,/Edit Client/);
+  assert.equal(form.clientEditor.id,42);assert.equal(resume.draft._primaryProperty.id,101);
+  assert.equal(resume.draft._originalRow._primaryProperty.id,101);
+  assert.equal(resume.draft._clientDraft.contact_0_first_name,undefined);
+  assert.equal(resume.draft.property_0_street1,undefined);
+  form.values={...resume.draft._clientDraft};await submit();
+  assert.deepEqual(writes.filter(w=>/^clients(?:\/42)?$/.test(w.key)).map(w=>[w.key,w.method]),[['clients','POST'],['clients/42','PATCH']]);
+  assert.equal(writes.filter(w=>w.key==='contacts').length,1);
+  assert.equal(writes.filter(w=>w.key==='properties'&&w.method==='POST').length,2);
+  assert.ok(writes.some(w=>w.key==='properties/101'&&w.method==='PATCH'));
+});
+
+for(const edited of [false,true])test('Pending client detour retains new extras and '+(edited?'PATCHes edited':'removes only unchanged')+' submitted rows', async () => {
+  let release;const writes=[],created={id:42,display_name:'Client'};
+  const h=createHarness(async(path,options={})=>{
+    const key=path.replace('/api/',''),method=options.method||'GET';let value=[];
+    if(method!=='GET')writes.push({key,method,body:JSON.parse(options.body)});
+    if(key==='clients'&&method==='POST')value=await new Promise(resolve=>{release=()=>resolve(created);});
+    else if(key==='clients')value=[created];
+    else if(key==='clients/42')value=created;
+    else if(method==='POST'&&(key==='properties'||key==='contacts'))value={id:(key==='properties'?100:200)+writes.filter(w=>w.key===key).length};
+    return {ok:true,status:200,json:async()=>value};
+  });
+  h.run('render=async()=>{};org={};');await h.run("builder('clients')");
+  const form=h.elements.get('#builder');
+  form.values={first_name:'Client',contact_0_first_name:'Alex',property_0_street1:'Old address'};
+  const submit=()=>form.onsubmit({target:form,preventDefault(){}}),saving=submit();
+  Object.assign(form.values,{contact_1_email:'new@example.test',property_1_street1:'New address'});
+  if(edited)Object.assign(form.values,{contact_0_first_name:'Alex edited',property_0_street1:'Edited address'});
+  const target=h.makeEl();target.hasAttribute=name=>name==='data-client-custom-field';target.matches=()=>false;
+  target.closest=selector=>selector==='[data-close]'?null:selector==='#builder'?form:target;
+  await h.listeners.click[0]({target,preventDefault(){}});
+  const resume=h.elements.get('#action-form').resumeClient;
+  release();await saving;await loopClick(h,{},['data-client-cf-back']);
+  const html=h.elements.get('#overlay').innerHTML;
+  assert.match(html,/Edit Client/);assert.match(html,/new@example.test/);assert.match(html,/New address/);
+  assert.equal(resume.draft._clientDraft.contact_1_email,'new@example.test');
+  assert.equal(resume.draft._clientDraft.property_1_street1,'New address');
+  if(edited){assert.match(html,/name="contact_0_id" value="201"/);assert.match(html,/name="property_0_id" value="101"/);}
+  else {assert.equal(resume.draft.contact_0_first_name,undefined);assert.equal(resume.draft._clientDraft.property_0_street1,undefined);}
+  form.values={...resume.draft._clientDraft};await submit();
+  assert.equal(writes.filter(w=>w.key==='contacts'&&w.method==='POST').length,2);
+  assert.equal(writes.filter(w=>w.key==='properties'&&w.method==='POST').length,2);
+  assert.equal(writes.find(w=>w.key==='contacts'&&w.body.email==='new@example.test').body.name,'new@example.test');
+  assert.ok(writes.some(w=>w.key==='properties'&&w.body.street1==='New address'));
+  if(edited){assert.equal(writes.find(w=>w.key==='contacts/201').body.name,'Alex edited');assert.equal(writes.find(w=>w.key==='properties/101').body.street1,'Edited address');}
+});
+
+for(const subsequent of ['none','display_name','first_name'])test('Pending client detour synchronizes saved display name and preserves '+subsequent, async () => {
+  let release;const writes=[],original={id:1,first_name:'John',last_name:'Smith',display_name:'John Smith'};
+  const h=createHarness(async(path,options={})=>{
+    const key=path.replace('/api/',''),method=options.method||'GET';let value=[];
+    if(method!=='GET')writes.push({key,method,body:JSON.parse(options.body)});
+    if(key==='clients/1'&&method==='PATCH')value=writes.filter(w=>w.key===key).length===1?await new Promise(resolve=>{release=()=>resolve({...original,first_name:'Jane',display_name:'Jane Smith'});}):{...original,...JSON.parse(options.body)};
+    else if(key==='clients/1')value=original;
+    else if(key==='clients')value=[original];
+    return {ok:true,status:200,json:async()=>value};
+  });
+  h.run('render=async()=>{};org={};');await h.run("builder('clients',1)");
+  const form=h.elements.get('#builder');form.values={first_name:'Jane',last_name:'Smith',display_name:'John Smith'};
+  const disp={get value(){return form.values.display_name;},set value(v){form.values.display_name=v;}};
+  form.querySelector=sel=>sel==='[name="display_name"]'?disp:null;
+  const submit=()=>form.onsubmit({target:form,preventDefault(){}}),saving=submit();
+  if(subsequent==='display_name')form.values.display_name='Custom name';
+  if(subsequent==='first_name')form.values.first_name='Janet';
+  const target=h.makeEl();target.hasAttribute=name=>name==='data-client-custom-field';target.matches=()=>false;
+  target.closest=selector=>selector==='[data-close]'?null:selector==='#builder'?form:target;
+  await h.listeners.click[0]({target,preventDefault(){}});
+  const resume=h.elements.get('#action-form').resumeClient;
+  release();await saving;
+  assert.equal(disp.value,subsequent==='display_name'?'Custom name':'Jane Smith');
+  await loopClick(h,{},['data-client-cf-back']);
+  assert.match(h.elements.get('#overlay').innerHTML,/Edit Client/);
+  assert.equal(resume.draft._clientDraft.first_name,subsequent==='first_name'?'Janet':'Jane');
+  form.values={...resume.draft._clientDraft};await submit();
+  const patches=writes.filter(w=>w.key==='clients/1');assert.equal(patches.length,2);
+  assert.equal(patches[0].body.display_name,'Jane Smith');
+  assert.equal(patches[1].body.display_name,subsequent==='display_name'?'Custom name':subsequent==='first_name'?'Janet Smith':'Jane Smith');
+});
+
+for(const failure of ['refresh','extras'])for(const dom of [false,true])test(`Client retry advances baseline after ${failure} failure (DOM ${dom})`,async()=>{
+  const original={id:1,first_name:'John',last_name:'Smith',display_name:'John Smith'},writes=[];let failed=false;
+  const h=createHarness(async(path,options={})=>{
+    const key=path.replace('/api/',''),method=options.method||'GET',body=options.body?JSON.parse(options.body):{};let value=[];
+    if(method!=='GET')writes.push({key,method,body});
+    if(!failed&&((failure==='extras'&&key==='contacts'&&body.name==='Second')||(failure==='refresh'&&key==='clients'))){failed=true;throw Error('Injected failure');}
+    if(key==='clients/1')value=method==='PATCH'?{...original,...body}:original;
+    if(key==='properties')value=method==='POST'?{id:body.is_primary?100:101}:[];
+    if(key==='contacts'&&method==='POST')value={id:body.name==='First'?201:202};
+    return {ok:true,status:200,json:async()=>value};
+  });
+  h.run('render=async()=>{};org={};');await h.run("builder('clients',1)");
+  const form=h.elements.get('#builder');form.values={first_name:'Jane',last_name:'Smith',display_name:'John Smith',property_street1:'Primary',property_0_street1:'Extra',contact_0_first_name:'First',contact_1_first_name:'Second'};
+  if(dom)form.querySelector=sel=>{const name=sel.match(/^\[name="([^"]+)"\]$/)?.[1];return name&&name in form.values?{get value(){return form.values[name];},set value(v){form.values[name]=v;}}:null;};
+  const submit=()=>form.onsubmit({target:form,preventDefault(){}});await submit();assert.equal(failed,true);
+  assert.equal(form.values.display_name,'Jane Smith');assert.equal(form.clientEditor.row._originalRow.first_name,'Jane');assert.equal(form.clientEditor.row._primaryProperty.id,100);
+  assert.equal(form.clientEditor.lastSavedExtras.extrasResult.savedContacts.contact_0_,201);
+  form.values.first_name='Janet';await submit();
+  assert.equal(writes.filter(w=>w.key==='clients/1')[1].body.display_name,'Janet Smith');
+  assert.equal(writes.filter(w=>w.key==='properties'&&w.method==='POST').length,2);
+  assert.equal(writes.filter(w=>w.key==='contacts'&&w.body.name==='First').length,1);
+  for(const key of ['properties/100','properties/101','contacts/201'])assert.ok(writes.some(w=>w.key===key&&w.method==='PATCH'));
+});
+
+test('Client extras without response IDs skip unchanged successful prefixes on retry',async()=>{
+  const h=loopHarness();h.run('window.persisted={primaryPropertyId:null,savedProps:{},savedContacts:{},submittedRaw:{}}');
+  for(let i=0;i<2;i++)await h.run("saveClientExtras(1,{property_street1:'Main',property_0_street1:'Other',contact_0_first_name:'Alex'},null,true,window.persisted)");
+  assert.equal(h.writes.filter(w=>w.key==='properties').length,2);assert.equal(h.writes.filter(w=>w.key==='contacts').length,1);
+});
+
+test('New client builder persists explicitly cleared custom field defaults on reopen', async () => {
+  const values=[],created={id:42,display_name:'Cleared default'};
+  const h=createHarness(async(path,options={})=>{
+    const key=path.replace('/api/','');let value=[];
+    if(key==='custom-fields')value=[{id:7,entity_type:'clients',field_name:'Code',field_type:'text',default_value:'ABC'}];
+    if(key==='custom-field-values'){if(options.method==='POST')values.push(JSON.parse(options.body));value=values;}
+    if(key==='clients')value=options.method==='POST'?created:[created];
+    if(key==='clients/42')value=created;
+    return {ok:true,status:200,json:async()=>value};
+  });
+  const host=h.makeEl();h.elements.set('#client-custom-fields',host);
+  h.run("render=async()=>{};org={};");
+  await h.run("builder('clients')");assert.match(host.innerHTML,/value="ABC"/);
+  const form=h.elements.get('#builder');form.values={first_name:'Cleared default',custom_field_7:''};
+  await form.onsubmit({target:form,preventDefault(){}});
+  assert.equal(values.length,1);assert.equal(values[0].entity_id,42);assert.equal(values[0].value_text,'');
+  await h.run("builder('clients',42)");assert.match(host.innerHTML,/name="custom_field_7"[^>]*value=""/);assert.doesNotMatch(host.innerHTML,/value="ABC"/);
+});
+
+test('Delayed clipboard fallback and upstream requests preserve newer editors and views', async () => {
+  for(const action of ['direct','copy-referral'])for(const change of ['panel','view']){
+    const h=loopHarness({'account-billing':{referral_code:'CODE'}});
+    h.run("navigator={clipboard:{writeText:()=>new Promise((resolve,reject)=>window.rejectCopy=reject)}};");
+    const pending=action==='direct'?h.run("copyText('CODE','Copied')"):loopClick(h,{action});
+    for(let i=0;i<20&&!h.run('Boolean(window.rejectCopy)');i++)await Promise.resolve();
+    assert.equal(h.run('Boolean(window.rejectCopy)'),true);
+    if(change==='panel')await h.run("builder('clients')");else h.run('viewVersion++');
+    const overlay=h.elements.get('#overlay'),html=overlay.innerHTML,form=h.elements.get('#builder');form.values={first_name:'Unsaved work'};
+    h.run("window.rejectCopy(Error('Denied'))");await pending;
+    assert.equal(overlay.innerHTML,html);assert.equal(form.values.first_name,'Unsaved work');
+  }
+  for(const action of ['copy-referral','copy-hub','review-responses']){
+    const h=loopHarness();h.run("clients=[{id:1}];navigator={};window.realFetch=fetch;fetch=()=>new Promise(resolve=>window.releaseFetch=()=>resolve({ok:true,status:200,json:async()=>({referral_code:'CODE',token:'hub'})}));");
+    const pending=loopClick(h,{action});await Promise.resolve();
+    h.run('fetch=window.realFetch');await h.run("builder('clients')");
+    const html=h.elements.get('#overlay').innerHTML;h.elements.get('#builder').values={first_name:'Keep draft'};
+    h.run('window.releaseFetch()');await pending;
+    assert.equal(h.elements.get('#overlay').innerHTML,html);assert.equal(h.elements.get('#builder').values.first_name,'Keep draft');
+  }
+});
+
+test('Opening balance fallback sums unique active invoice identities', async () => {
+  const h=loopHarness({'invoices/1':{total_cents:5000},'invoices/2':{total_cents:3000},'invoices/3':{total_cents:9000,status:'void'},'invoices/4':{total_cents:9000,job_id:1}}, {'initial_balance_invoice:1':{invoice_id:1,invoice_ids:[1,2,2,3,4]}});
+  await h.run("recordDetailAction('clients',{id:1},'Set initial balance')");
+  assert.match(h.elements.get('#overlay').innerHTML,/name="balance"[^>]*value="80"/);
+});
+
+test('T15 missing receipt, clipboard fallback, midnight slot and unknown route', async () => {
+  const h = loopHarness({ 'account-billing': { payments: [] }, jobs: [{ id: 1, title: 'Late job' }] });
+  await loopClick(h, { receipt: '999' }); assert.match(h.elements.get('#overlay').innerHTML, /Receipt not found/);
+  for (const setup of ["navigator={}", "navigator={clipboard:{writeText:async()=>{throw Error('Denied');}}}"]) {
+    h.run(setup); await h.run("copyText('https://example.test/link','Copied','Copy Link')");
+    assert.match(h.elements.get('#overlay').innerHTML, /https:\/\/example.test\/link/);
+  }
+  const target = h.makeEl(); target.dataset = { slot: '2030-01-07T23:00' }; target.hasAttribute = () => false; target.matches = () => false;
+  target.closest = selector => ['[data-close]', '[data-appointment]'].includes(selector) ? null : target;
+  await h.listeners.click[0]({ target, preventDefault() {} });
+  assert.match(h.elements.get('#overlay').innerHTML, /name="end"[^>]*value="2030-01-08T00:00"/);
+  await h.run("route='not-a-real-route';render()"); assert.match(h.elements.get('#workspace').innerHTML, /Page not found/);
+});
+
+test('T15 company settings update live brand and tolerate absent header', async () => {
+  for (const hasHeader of [true, false]) {
+    const h = loopHarness(); const brand = h.makeEl();
+    if (hasHeader) h.elements.set('#header .brand > span:not(#breadcrumb)', brand);
+    const form = h.makeEl(); form.values = { name: 'New company' };
+    h.elements.set('#company-test', form);
+    await h.run("saveCompanySettings({preventDefault(){},target:document.querySelector('#company-test')})");
+    assert.equal(h.run('org.name'), 'New company');
+    if (hasHeader) assert.equal(brand.textContent, 'New company');
+    assert.equal(h.writes.find(w => w.key === 'settings').body.name, 'New company');
+  }
+});
+
+test('T15 property editing refreshes drawer and deletion returns to client', async () => {
+  const h = loopHarness({ 'properties/1': { id: 1, client_id: 2, street1: 'Old street' }, properties: [{ id: 1 }] });
+  const edit = h.makeEl(), del = h.makeEl(); del.dataset.propertyAction = 'Delete property';
+  h.elements.set('[data-property-edit]', edit); h.queryAllMap.set('[data-property-action]', [del]);
+  await h.run('propertyDetail(1)'); await edit.onclick(); await loopSubmit(h, { street1: 'New street' });
+  assert.match(h.elements.get('#overlay').innerHTML, /New street/);
+  assert.equal(h.run('cache.properties.length'), 1);
+  h.run('window.returned=null;detail=async(type,id)=>{window.returned={type,id};}');
+  await del.onclick();
+  assert.deepEqual(JSON.parse(h.run('JSON.stringify(window.returned)')), { type: 'clients', id: 2 });
+  assert.equal(h.writes.at(-1).method, 'DELETE');
 });

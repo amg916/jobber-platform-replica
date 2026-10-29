@@ -99,6 +99,10 @@ body:has(#sidebar.collapsed) #workspace { margin-left: 64px; }
 .dark .empty-appointments-shaded, .dark .appointment-remaining { background: #183440; color: #edf2f3; }
 @media (max-width: 1000px) { .home-head ~ .home-lower { grid-template-columns: 1fr; } }
 @media (max-width: 700px) {
+ #breadcrumb:not(:empty) { display: none; }
+ header .brand { min-width: 0; overflow: hidden; }
+ .brand > span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ .header-tools button.icon { width: 34px; height: 34px; min-height: 34px; padding: 5px; }
  #sidebar a.nav { width: 48px; justify-content: center; }
  #sidebar .nav-label, #sidebar .nav-chevron-btn, #sidebar #insights-sub { display: none; }
 }

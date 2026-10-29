@@ -12,6 +12,8 @@ export function webhookInput(data,creating=false) {
  else if(Object.keys(out).length===0)fail('No webhook fields provided');
  return out;
 }
+export function parseObject(raw) { try { const p=typeof raw==='string'?JSON.parse(raw):raw;return p&&typeof p==='object'&&!Array.isArray(p)?p:{}; } catch { return {}; } }
+export function parseConditions(raw) { if(!raw)return {};if(typeof raw==='object'&&!Array.isArray(raw))return raw;try{const p=JSON.parse(raw);return p&&typeof p==='object'&&!Array.isArray(p)?p:null;}catch{return null;} }
 const parseKeys=raw=>{try{const p=JSON.parse(raw||'[]');return Array.isArray(p)?p:[];}catch{return [];}};
 export function deliverWebhook(repo,sub,payload,now=new Date(),eventKey=null) {
  const payloadJson=JSON.stringify(payload),signature=createHmac('sha256',sub.secret||'jobber-webhook-secret').update(payloadJson).digest('base64');
@@ -50,7 +52,7 @@ export function emit(repo,event,type,id,eventKey,now=new Date()) {
   deliverWebhook(repo,sub,{event,entity_type:type,entity_id:id,event_key:eventKey,created_at:now.toISOString()},now,eventKey);
  }
  for(const rule of repo.list('automations',{trigger_event:event,is_enabled:1})) {
-  if(!matches(entity,JSON.parse(rule.conditions_json||'{}'))) continue;
+  const conditions=typeof rule.conditions_json==='object'&&rule.conditions_json!==null&&!Array.isArray(rule.conditions_json)?rule.conditions_json:JSON.parse(rule.conditions_json||'{}');if(!conditions||typeof conditions!=='object'||Array.isArray(conditions))throw TypeError('Invalid automation conditions');if(!matches(entity,conditions))continue;
   const key=`${rule.id}:${eventKey}`; const existing=repo.list('automation_executions',{idempotency_key:key})[0]; if(existing) {result.push(existing);continue;}
   result.push(repo.insert('automation_executions',{automation_id:rule.id,trigger_event:event,entity_type:type,entity_id:id,idempotency_key:key,status:'queued',max_attempts:3,scheduled_for:new Date(+now+rule.delay_minutes*60000).toISOString()}));
  }
@@ -62,7 +64,9 @@ export function sendMessage(repo,clientId,channel,body,subject='',related={}) {
  return repo.insert('messages',{client_id:clientId,channel,direction:'outbound',recipient:channel==='sms'?client.mobile_phone||client.phone:client.email,subject,body,...related,status:'test_mode',provider_mode:'sandbox'});
 }
 function execute(repo,run,rule) {
- const config=JSON.parse(rule.action_config_json||'{}'),entity=repo.get(run.entity_type,run.entity_id),clientId=run.entity_type==='clients'?entity.id:entity.client_id;
+ const config=typeof rule.action_config_json==='object'&&rule.action_config_json!==null&&!Array.isArray(rule.action_config_json)?rule.action_config_json:JSON.parse(rule.action_config_json||'{}');
+ if(!config||typeof config!=='object'||Array.isArray(config))throw TypeError('Invalid automation action configuration');
+ const entity=repo.get(run.entity_type,run.entity_id),clientId=run.entity_type==='clients'?entity.id:entity.client_id;
  switch(rule.action_type) {
   case 'send_email': case 'send_sms': { const client=repo.get('clients',clientId),name=client.display_name||[client.first_name,client.last_name].filter(Boolean).join(' ')||'Client',fill=s=>String(s??'').replace(/\{\{\s*client_name\s*\}\}/g,()=>name); return sendMessage(repo,clientId,rule.action_type==='send_email'?'email':'sms',fill(config.body||rule.name),fill(config.subject||rule.name)); }
   case 'create_task': case 'schedule_followup': return repo.insert('tasks',{client_id:clientId,job_id:run.entity_type==='jobs'?entity.id:null,title:config.title||rule.name,instructions:config.instructions||'',due_date:config.due_date||new Date().toISOString().slice(0,10),assigned_user_id:config.assigned_user_id||null});
@@ -83,7 +87,8 @@ export function runPending(db,now=new Date()) {
   const repo=repository(db,entry.organization_id);
   try { results.push(transaction(db,()=>{
    const run=repo.get('automation_executions',entry.id); if(run.status!=='queued') return run;
-   const rule=repo.get('automations',run.automation_id),entity=repo.list(run.entity_type,{id:run.entity_id})[0],conditions=JSON.parse(rule.conditions_json||'{}'),delayed=Number(rule.delay_minutes)>0;
+   const rule=repo.get('automations',run.automation_id),entity=repo.list(run.entity_type,{id:run.entity_id})[0],conditions=parseConditions(rule.conditions_json),delayed=Number(rule.delay_minutes)>0;
+   if(conditions===null)return repo.update('automation_executions',run.id,{status:'skipped',executed_at:now.toISOString()});
    const sentLogs=delayed&&run.trigger_event==='quote_sent'&&conditions.status==='awaiting_response'&&entity?repo.list('activity_logs',{entity_type:'quotes',entity_id:entity.id,action:'sent'}):[];
    const canonicalBase=`${run.automation_id}:quote_sent:quotes:${entity?.id}`,canonicalKeys=new Set([canonicalBase,...sentLogs.map(l=>`${canonicalBase}:${l.id}`)]);
    const staleTrigger=delayed&&sentLogs.length>1&&canonicalKeys.has(run.idempotency_key)&&run.idempotency_key!==`${canonicalBase}:${sentLogs.at(-1).id}`;

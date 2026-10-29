@@ -4,6 +4,9 @@ import { scheduleVisit, conflicts, interval, teamIds, generateVisits } from './r
 import { emit, sendMessage, matches } from './automations.js';
 import { checkAvailability } from './availability.js';
 const now=()=>new Date().toISOString();
+function parseObject(raw) { try { const p=typeof raw==='string'?JSON.parse(raw):raw;return p&&typeof p==='object'&&!Array.isArray(p)?p:{}; } catch { return {}; } }
+export function parseInitialBalanceIds(raw) { const p=parseObject(raw);return [...new Set([...(Array.isArray(p?.invoice_ids)?p.invoice_ids:[]),p?.invoice_id].filter(id=>Number.isSafeInteger(id)&&id>0))]; }
+function parseSegmentFilter(raw) { if(raw===null||raw===undefined||raw==='')return {};let p=raw;if(typeof raw==='string'){try{p=JSON.parse(raw);}catch{fail('Invalid campaign segment filter',400);}}if(!p||typeof p!=='object'||Array.isArray(p))fail('Invalid campaign segment filter',400);return p; }
 export function workflows(db,org,actor=null) {
  const r=repository(db,org);
  const atomic=fn=>(...args)=>transaction(db,()=>fn(...args));
@@ -16,8 +19,60 @@ export function workflows(db,org,actor=null) {
   lines.forEach((line,index)=>{ const {id,organization_id,quote_id,invoice_id,...rest}=line; if(!isQuote) { delete rest.is_optional; delete rest.is_selected; delete rest.unit_cost_cents; delete rest.markup_percent; } r.insert(lineTable,{...rest,[isQuote?'quote_id':'invoice_id']:row.id,sort_order:index}); });
   return log(type,row,'created');
  }
+ function initialBalanceIds(id) { return [...new Set(db.prepare('SELECT value_json FROM preferences WHERE organization_id=? AND name=? ORDER BY id ASC').all(org,'initial_balance_invoice:'+id).flatMap(p=>parseInitialBalanceIds(p.value_json)))]; }
+ function activeInitialBalances(id,ids) { return ids.map(invId=>db.prepare('SELECT * FROM invoices WHERE id=? AND organization_id=? AND client_id=?').get(invId,org,id)).filter(inv=>inv&&!inv.job_id&&!inv.quote_id&&!['void','bad_debt'].includes(inv.status)); }
+ function initialBalanceInvoices(id) { return activeInitialBalances(id,initialBalanceIds(id)); }
+ function writeInitialBalanceIds(id,ids) {
+  const clean=[...new Set(ids.filter(id=>Number.isSafeInteger(id)&&id>0))];
+  db.prepare('DELETE FROM preferences WHERE organization_id=? AND name=?').run(org,'initial_balance_invoice:'+id);
+  if(clean.length)r.insert('preferences',{name:'initial_balance_invoice:'+id,value_json:JSON.stringify({invoice_id:clean[0],invoice_ids:clean})});
+ }
  const api={r,
+  initialBalanceMap:()=>{
+   const prefs=db.prepare("SELECT name, value_json FROM preferences WHERE organization_id=? AND name >= 'initial_balance_invoice:' AND name < 'initial_balance_invoice;' ORDER BY id ASC").all(org),balances=new Map();
+   if(!prefs.length)return balances;
+   const byClient=new Map(),invoiceIds=new Set();
+   for(const p of prefs){const suffix=p.name.slice(24),cid=Number(suffix);if(!/^[1-9]\d*$/.test(suffix)||!Number.isSafeInteger(cid))continue;const ids=byClient.get(cid)||new Set();for(const id of parseInitialBalanceIds(p.value_json)){ids.add(id);invoiceIds.add(id);}byClient.set(cid,ids);balances.set(cid,0);}
+   const ids=[...invoiceIds];
+   for(let i=0;i<ids.length;i+=500){const chunk=ids.slice(i,i+500),invoices=db.prepare(`SELECT id, client_id, job_id, quote_id, status, total_cents FROM invoices WHERE organization_id=? AND id IN (${chunk.map(()=>'?').join(',')})`).all(org,...chunk);for(const inv of invoices){const cid=inv.client_id;if(byClient.get(cid)?.has(inv.id)&&!inv.job_id&&!inv.quote_id&&!['void','bad_debt'].includes(inv.status))balances.set(cid,balances.get(cid)+(inv.total_cents||0));}}
+   return balances;
+  },
+  initialBalanceCents:id=>initialBalanceInvoices(id).reduce((s,inv)=>s+(inv.total_cents||0),0),
+  mergeInitialBalance:atomic((sourceId,targetId)=>{
+   const ids=[...new Set([...initialBalanceIds(targetId),...initialBalanceIds(sourceId)])],activeIds=activeInitialBalances(targetId,ids).map(inv=>inv.id);
+   writeInitialBalanceIds(sourceId,[]);writeInitialBalanceIds(targetId,activeIds);
+  }),
   createClient:atomic(data=>{ if(!String(data.display_name||'').trim()){const n=[data.first_name,data.last_name].filter(Boolean).join(' ').trim()||String(data.company_name||'').trim(); if(n) data={...data,display_name:n};} const row=r.insert('clients',{...data,portal_token:token()}); log('clients',row,'created');emit(r,'client_created','clients',row.id);return row; }),
+  setInitialBalance:atomic((id,balanceCents)=>{
+   r.get('clients',id);const amount=cents(balanceCents),entries=initialBalanceInvoices(id).map(inv=>{
+    const netAlloc=r.list('payment_allocations',{invoice_id:inv.id}).reduce((s,a)=>s+a.amount_cents,0)-r.list('refunds',{invoice_id:inv.id}).reduce((s,x)=>s+x.amount_cents,0);
+    return {inv,credited:Math.max(netAlloc,inv.amount_paid_cents||0,inv.deposits_applied_cents||0)};
+   }),creditedTotal=entries.reduce((s,e)=>s+e.credited,0);
+   const remove=inv=>{if(inv.status==='draft'){db.prepare('DELETE FROM invoice_line_items WHERE invoice_id=? AND organization_id=?').run(inv.id,org);db.prepare('DELETE FROM invoices WHERE id=? AND organization_id=?').run(inv.id,org);}else api.voidInvoice(inv.id);};
+   const resize=({inv,credited},total)=>{
+    db.prepare('DELETE FROM invoice_line_items WHERE invoice_id=? AND organization_id=?').run(inv.id,org);
+    r.insert('invoice_line_items',{invoice_id:inv.id,name:'Initial balance',description:'Opening account balance',quantity:1,unit_price_cents:total,taxable:0,total_cents:total,sort_order:0});
+    r.update('invoices',inv.id,{subtotal_cents:total,discount_cents:0,tax_cents:0,total_cents:total,balance_due_cents:Math.max(0,total-credited)});
+    if(inv.status==='draft')api.issueInvoice(inv.id,'upon_receipt');
+   };
+   if(entries.length){
+    if(amount===0){
+     if(creditedTotal>0)fail('Refund or unapply payments before clearing initial balance',409);
+     for(const {inv} of entries)remove(inv);
+     writeInitialBalanceIds(id,[]);reconcile(r,id);
+    }else{
+     if(amount<creditedTotal)fail('Initial balance cannot be less than payments already applied',409);
+     const ordered=[...entries].sort((a,b)=>(b.credited>0)-(a.credited>0)),primary=ordered[0],extras=ordered.slice(1);
+     for(const extra of extras)if(extra.credited===0)remove(extra.inv);
+     const paidExtras=extras.filter(e=>e.credited>0);
+     for(const e of paidExtras)resize(e,e.credited);
+     resize(primary,amount-paidExtras.reduce((s,e)=>s+e.credited,0));
+     if(primary.inv.status!=='draft'){reconcile(r,id);log('invoices',r.get('invoices',primary.inv.id),'updated');}
+     writeInitialBalanceIds(id,[primary.inv.id,...paidExtras.map(e=>e.inv.id)]);reconcile(r,id);
+    }
+   }else if(amount>0){const created=api.createInvoice({client_id:id,subject:'Initial balance',payment_terms:'upon_receipt'},[{name:'Initial balance',description:'Opening account balance',quantity:1,unit_price_cents:amount,taxable:0}]);api.issueInvoice(created.id,'upon_receipt');writeInitialBalanceIds(id,[created.id]);}else{writeInitialBalanceIds(id,[]);reconcile(r,id);}
+   return {...r.get('clients',id),initial_balance_cents:api.initialBalanceCents(id)};
+  }),
   createRequest:atomic(data=>{r.get('clients',data.client_id); const row=r.insert('requests',data); log('requests',row,'created');emit(r,'request_submitted','requests',row.id);return row;}),
   createQuote:atomic((data,items=[])=>document('quotes',data,items)),
   requestToQuote:atomic((id,data={},items=[])=>{const request=r.get('requests',id); if(request.status==='converted') fail('Request already converted',409); const quote=document('quotes',{...data,client_id:request.client_id,property_id:request.property_id,request_id:id,title:data.title||request.title},items);r.update('requests',id,{status:'converted'});return quote;}),
@@ -38,7 +93,7 @@ export function workflows(db,org,actor=null) {
   createInvoice:atomic((data,items=[])=>document('invoices',data,items)),
   invoiceJob:atomic((id,visitIds=null)=>{const job=r.get('jobs',id);let visits=[];if(visitIds){visits=visitIds.map(v=>r.get('visits',v));if(!visits.length||new Set(visitIds).size!==visitIds.length||visits.some(v=>v.job_id!==id||v.invoiced||v.status!=='completed'))fail('Visits must be completed, unique, and unbilled');}else {if(job.status!=='requires_invoicing')fail('Job must require invoicing');if(job.billing_type==='visit_based'){visits=r.list('visits',{job_id:id}).filter(v=>v.status==='completed'&&!v.invoiced);if(!visits.length)fail('Job already invoiced',409);}else if(db.prepare("SELECT 1 FROM invoices WHERE organization_id=? AND job_id=? AND status<>'void' LIMIT 1").get(org,id))fail('Job already invoiced',409);}
    const storedRow=!visits.length?db.prepare('SELECT value_json FROM preferences WHERE organization_id=? AND name=? ORDER BY id ASC LIMIT 1').get(org,`job_lines:${id}`):null;
-   const rawStored=storedRow?JSON.parse(storedRow.value_json):null;
+   let rawStored=null;if(storedRow){try{rawStored=JSON.parse(storedRow.value_json);}catch{}}
    const hasStored=Array.isArray(rawStored);
    const storedLines=hasStored?rawStored.filter(l=>l&&typeof l==='object'&&!Array.isArray(l)&&(!l.is_optional||l.is_selected)):null;
    const optsRow=!visits.length?db.prepare('SELECT value_json FROM preferences WHERE organization_id=? AND name=? ORDER BY id ASC LIMIT 1').get(org,`job_options:${id}`):null;
@@ -100,7 +155,7 @@ export function workflows(db,org,actor=null) {
    const property=r.insert('properties',{client_id:client.id,street1:data.address||'',is_primary:1});const request=api.createRequest({client_id:client.id,property_id:property.id,title:service.name,source:'online_booking'});const job=api.requestToJob(request.id,{total_cents:service.unit_price_cents,assigned_user_ids_json:ids});api.createVisit(job.id,{scheduled_start:start,scheduled_end:end,assigned_user_ids_json:ids});
    const booking=r.insert('online_bookings',{client_id:client.id,request_id:request.id,job_id:job.id,service_id:service.id,service_name:service.name,customer_name:client.display_name,customer_email:client.email,customer_phone:client.phone,address:data.address||'',requested_date:start.slice(0,10),requested_slot:start,assigned_user_id:ids[0],confirmation_code:token(),status:'confirmed'});sendMessage(r,client.id,'email',`Booking confirmed: ${start}`,'Booking confirmation');return booking;
   }),
-  sendCampaign:atomic(id=>{const campaign=r.get('campaigns',id);if(campaign.status==='sent')fail('Campaign already sent');const filter=JSON.parse(campaign.segment_filter_json||'{}');const clients=r.list('clients').filter(c=>c.status!=='archived'&&c.receives_marketing&&matches(c,filter)&&(campaign.channel==='email'?c.receives_email:c.receives_sms));const fill=(text,c)=>{const name=c.display_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Client';return String(text??'').replace(/\{\{\s*client_name\s*\}\}/g,()=>name);};for(const c of clients)sendMessage(r,c.id,campaign.channel,fill(campaign.body,c),fill(campaign.subject,c),{related_entity_type:'campaigns',related_entity_id:id});return r.update('campaigns',id,{status:'sent',sent_at:now(),recipients_count:clients.length,delivered_count:0});}),
+  sendCampaign:atomic(id=>{const campaign=r.get('campaigns',id);if(campaign.status==='sent')fail('Campaign already sent');const filter=parseSegmentFilter(campaign.segment_filter_json);const clients=r.list('clients').filter(c=>c.status!=='archived'&&c.receives_marketing&&matches(c,filter)&&(campaign.channel==='email'?c.receives_email:c.receives_sms));const fill=(text,c)=>{const name=c.display_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Client';return String(text??'').replace(/\{\{\s*client_name\s*\}\}/g,()=>name);};for(const c of clients)sendMessage(r,c.id,campaign.channel,fill(campaign.body,c),fill(campaign.subject,c),{related_entity_type:'campaigns',related_entity_id:id});return r.update('campaigns',id,{status:'sent',sent_at:now(),recipients_count:clients.length,delivered_count:0});}),
   overdue:atomic(()=>{for(const c of r.list('clients'))reconcile(r,c.id);const invoices=r.list('invoices').filter(i=>i.balance_due_cents>0&&i.due_date<now().slice(0,10)&&!['draft','void','bad_debt'].includes(i.status));for(const i of invoices)emit(r,'invoice_overdue','invoices',i.id,`overdue:${i.id}:${now().slice(0,10)}`);return invoices;})
  };return api;
 }
