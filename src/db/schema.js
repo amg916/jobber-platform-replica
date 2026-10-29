@@ -91,6 +91,7 @@ export function migrate(db) {
  db.exec('UPDATE campaigns SET updated_at=COALESCE(sent_at,created_at) WHERE updated_at IS NULL');
  atomic(()=>!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='website'),"ALTER TABLE organizations ADD COLUMN website TEXT");
  atomic(()=>!db.prepare('PRAGMA table_info(organizations)').all().some(c=>c.name==='address_line2'),"ALTER TABLE organizations ADD COLUMN address_line2 TEXT");atomic(()=>!db.prepare('PRAGMA table_info(invoices)').all().some(c=>c.name==='disclaimer_notes'),"ALTER TABLE invoices ADD COLUMN disclaimer_notes TEXT");
+ atomic(()=>{const cols=db.prepare('PRAGMA table_info(notes)').all().map(c=>c.name);return cols.includes('body')&&cols.includes('content')&&Boolean(db.prepare('SELECT 1 FROM notes WHERE body IS NULL OR content IS NULL LIMIT 1').get());},"UPDATE notes SET body = COALESCE(body, content, ''), content = COALESCE(content, body, '') WHERE body IS NULL OR content IS NULL");
  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS org_slug ON organizations(slug);
  CREATE UNIQUE INDEX IF NOT EXISTS session_token ON sessions(token);
  CREATE UNIQUE INDEX IF NOT EXISTS portal_token ON clients(portal_token) WHERE portal_token IS NOT NULL;
