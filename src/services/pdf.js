@@ -1,15 +1,48 @@
+import { inflateSync, deflateSync } from 'node:zlib';
 import { fail, transaction } from '../db/database.js';
 import { calculateDocument, reconcile } from './calculations.js';
 const validIsoDate=s=>/^\d{4}-\d{2}-\d{2}$/.test(String(s))&&(()=>{const ms=Date.parse(String(s)+'T00:00:00Z');return Number.isFinite(ms)&&new Date(ms).toISOString().slice(0,10)===String(s);})();
 const escapePDF=value=>String(value??'').replace(/[^\x20-\x7e]/g,'?').replace(/[\\()]/g,'\\$&');
+function decodePngToPdfImage(dataUrl){
+ const rawUrl=String(dataUrl||'').trim();if(!rawUrl)return null;
+ const m=/^data:image\/png;base64,([A-Za-z0-9+/=\s]+)$/.exec(rawUrl);if(!m)return null;
+ try{
+  const buf=Buffer.from(m[1],'base64');
+  if(buf.length<33||buf.readUInt32BE(0)!==0x89504e47||buf.readUInt32BE(4)!==0x0d0a1a0a)return null;
+  const width=buf.readUInt32BE(16),height=buf.readUInt32BE(20),bitDepth=buf[24],colorType=buf[25],compression=buf[26],filterMethod=buf[27],interlace=buf[28];
+  if(!width||!height||width>2000||height>2000||bitDepth!==8||![0,2,3,4,6].includes(colorType)||compression!==0||filterMethod!==0||interlace!==0)return null;
+  const idats=[];let plte=null,trns=null;
+  for(let off=8;off+8<=buf.length;){const len=buf.readUInt32BE(off),type=buf.toString('ascii',off+4,off+8);if(off+12+len>buf.length)return null;const chunk=buf.subarray(off+8,off+8+len);if(type==='PLTE')plte=chunk;else if(type==='tRNS')trns=chunk;else if(type==='IDAT')idats.push(chunk);else if(type==='IEND')break;off+=12+len;}
+  if(!idats.length||(colorType===3&&(!plte||plte.length<3||plte.length%3!==0)))return null;
+  const bpp=colorType===6?4:colorType===2?3:colorType===4?2:1,stride=width*bpp,expectedLen=height*(1+stride),raw=inflateSync(Buffer.concat(idats),{maxOutputLength:expectedLen});
+  if(raw.length!==expectedLen)return null;
+  const cur=new Uint8Array(stride),prev=new Uint8Array(stride),rgb=Buffer.alloc(width*height*3);
+  const paeth=(a,b,c)=>{const p=a+b-c,pa=Math.abs(p-a),pb=Math.abs(p-b),pc=Math.abs(p-c);return pa<=pb&&pa<=pc?a:pb<=pc?b:c;};
+  for(let y=0;y<height;y++){
+   const rowOff=y*(1+stride),f=raw[rowOff];if(f>4)return null;
+   for(let i=0;i<stride;i++){const x=raw[rowOff+1+i],a=i>=bpp?cur[i-bpp]:0,b=prev[i],c=i>=bpp?prev[i-bpp]:0;cur[i]=(x+(f===1?a:f===2?b:f===3?((a+b)>>1):f===4?paeth(a,b,c):0))&255;}
+   prev.set(cur);
+   for(let x=0;x<width;x++){
+    const si=x*bpp,di=(y*width+x)*3;let r,g,b,al=1;
+    if(colorType===3){const idx=cur[si],po=idx*3;if(po+2>=plte.length)return null;r=plte[po];g=plte[po+1];b=plte[po+2];al=(trns&&idx<trns.length?trns[idx]:255)/255;}
+    else{r=cur[si];g=bpp>=3?cur[si+1]:r;b=bpp>=3?cur[si+2]:r;al=(bpp===4?cur[si+3]:bpp===2?cur[si+1]:255)/255;}
+    rgb[di]=Math.round(r*al+255*(1-al));rgb[di+1]=Math.round(g*al+255*(1-al));rgb[di+2]=Math.round(b*al+255*(1-al));
+   }
+  }
+  return {width,height,hex:deflateSync(rgb).toString('hex')+'>'};
+ }catch{return null;}
+}
 export function generatePDF(document,items=[],organization={name:'J S Custom Tile'},signature=null) {
  const money=c=>`$${((c||0)/100).toFixed(2)}`;
  const text=[organization.name,document.subject?'INVOICE':'QUOTE',document.title||document.subject||'',`Number: ${document.quote_number||document.invoice_number||document.id}`,`Status: ${document.status}`,`Issued: ${document.issued_date||''}`, '',...items.map(i=>`${i.name}   ${i.quantity} x ${money(i.unit_price_cents)}   ${money(i.total_cents)}`),'',`Subtotal: ${money(document.subtotal_cents)}`,`Discount: ${money(document.discount_cents)}`,`Tax: ${money(document.tax_cents)}`,`Total: ${money(document.total_cents)}`,`Balance: ${money(document.balance_due_cents??document.total_cents)}`,document.client_message||''];
- if(signature?.name||signature?.signature||document.approved_by_name)text.push(`Signed by: ${signature?.name||document.approved_by_name||'Client'}${signature?.signature?' ('+signature.signature+')':''}`);
+ if(signature?.name||signature?.signature||signature?.signature_data||document.approved_by_name)text.push(`Signed by: ${signature?.name||document.approved_by_name||'Client'}${signature?.signature?' ('+signature.signature+')':''}`);
+ const sigImg=signature?.signature_data?decodePngToPdfImage(signature.signature_data):null;
  const pages=[];for(let i=0;i<text.length;i+=42)pages.push(text.slice(i,i+42));
  const objects=['<< /Type /Catalog /Pages 2 0 R >>','', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
+ let sigObjId=null;
+ if(sigImg){sigObjId=objects.length+1;objects.push(`<< /Type /XObject /Subtype /Image /Width ${sigImg.width} /Height ${sigImg.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/ASCIIHexDecode /FlateDecode] /Length ${Buffer.byteLength(sigImg.hex)} >>\nstream\n${sigImg.hex}\nendstream`);}
  const pageIds=[];
- for(const lines of pages){const pageId=objects.length+1,streamId=pageId+1;pageIds.push(pageId);const stream=`BT /F1 12 Tf 48 752 Td 16 TL\n${lines.map((line,i)=>`${i?'T* ':''}(${escapePDF(line)}) Tj`).join('\n')}\nET`;objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${streamId} 0 R >>`,`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`);}
+ for(const [pIdx,lines] of pages.entries()){const pageId=objects.length+1,streamId=pageId+1,hasSigImg=sigObjId&&pIdx===pages.length-1,sigY=Math.max(36,752-lines.length*16-64);pageIds.push(pageId);const stream=`BT /F1 12 Tf 48 752 Td 16 TL\n${lines.map((line,i)=>`${i?'T* ':''}(${escapePDF(line)}) Tj`).join('\n')}\nET${hasSigImg?`\nq 180 0 0 55 48 ${sigY} cm /Sig1 Do Q`:''}`;objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >>${hasSigImg?` /XObject << /Sig1 ${sigObjId} 0 R >>`:''} >> /Contents ${streamId} 0 R >>`,`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`);}
  objects[1]=`<< /Type /Pages /Kids [${pageIds.map(id=>`${id} 0 R`).join(' ')}] /Count ${pages.length} >>`;
  let output='%PDF-1.4\n';const offsets=[0];objects.forEach((o,i)=>{offsets.push(Buffer.byteLength(output));output+=`${i+1} 0 obj\n${o}\nendobj\n`;});const xref=Buffer.byteLength(output);output+=`xref\n0 ${objects.length+1}\n0000000000 65535 f \n${offsets.slice(1).map(o=>`${String(o).padStart(10,'0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;return Buffer.from(output);
 }
