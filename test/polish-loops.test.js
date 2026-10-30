@@ -117,6 +117,107 @@ function createHarness(apiData = {}) {
   };
 }
 
+test('T17: document line controls preserve descriptions, cents and zero quantity', () => {
+  const h = createHarness();
+  const html = h.run(`lineEditor({description:'A "quoted" line',unit_cost_cents:1234,quantity:0})`);
+  assert.match(html, /data-description[^>]*value="A &quot;quoted&quot; line"/);
+  assert.match(html, /data-cost[^>]*value="12.34"/);
+  assert.match(html, /data-qty[^>]*value="0"/);
+  for (const label of ['Line description', 'Unit cost', 'Quantity decrement', 'Quantity increment']) assert.ok(html.includes(label));
+});
+
+test('T17: quantity steppers clamp at zero and catalog fills editable cost and description', async () => {
+  const h = createHarness(), form = h.elements.get('#builder'), handlers = {}, qty = {value:0};
+  const inputs = {'[data-qty]':qty,'[data-name]':{},'[data-price]':{},'[data-description]':{},'[data-cost]':{}};
+  const line = {dataset:{line:'{}'},querySelector:s=>inputs[s]||null};
+  form.addEventListener = (name, fn) => {handlers[name]=fn;};
+  h.run(`cache.catalog=[{id:7,name:'Tile',description:'Install tile',unit_cost_cents:1250,unit_price_cents:2000}];bindDocumentEditor('jobs',{})`);
+  const click = step => handlers.click({target:{closest:()=>({type:'button',dataset:{lineQtyStep:String(step)},hasAttribute:n=>n==='data-line-qty-step',closest:()=>line})}});
+  click(-1); assert.equal(Number(qty.value),0);
+  click(1); assert.equal(Number(qty.value),1);
+  await handlers.change({target:{value:'7',dataset:{},matches:s=>s==='[data-catalog-pick]',closest:s=>s==='.line-item'?line:null}});
+  assert.equal(inputs['[data-description]'].value,'Install tile');
+  assert.equal(inputs['[data-cost]'].value,12.5);
+});
+
+test('T17: cost-only and description-only edits on jobs remain in PATCH items', async () => {
+  for (const changed of ['description','cost']) {
+    const writes=[];
+    const original={id:5,title:'Job',total_cents:2000,tax_rate:0,discount_type:'percent',discount_value:0,items:[{id:3,name:'Tile',description:'Old',quantity:1,unit_cost_cents:500,unit_price_cents:2000}]};
+    const h=createHarness(async(path,options)=>{if(options.method==='PATCH')writes.push(JSON.parse(options.body));return {ok:true,json:async()=>path==='/api/jobs/5'?original:[]};});
+    await h.run(`builder('jobs',5)`);
+    const form=h.elements.get('#builder');
+    form.values={title:'Job',value:'20',tax_rate:'0',discount_type:'percent',discount_value:'0'};
+    const vals={'[data-name]':'Tile','[data-qty]':'1','[data-price]':'20','[data-description]':changed==='description'?'New':'Old','[data-cost]':changed==='cost'?'6.25':'5'};
+    form.querySelectorAll=s=>s==='.line-item'?[{dataset:{line:JSON.stringify(original.items[0])},querySelector:s=>({value:vals[s]})}]:[];
+    h.run('render=async()=>{}');
+    await form.onsubmit({preventDefault(){},currentTarget:form});
+    assert.ok(writes[0]?.items,changed+' edit must not be optimized away');
+    assert.equal(writes[0].items[0].description,changed==='description'?'New':'Old');
+    assert.equal(writes[0].items[0].unit_cost_cents,changed==='cost'?625:500);
+  }
+});
+
+test('T17: payment rows restore values and expose numbered labels and document labels', () => {
+  const h = createHarness();
+  const fresh = h.run(`documentEditorFields('quotes',{})`);
+  for (const label of ['Required quote deposit','Payment 1 description','Payment 1 amount','Payment 2 description','Payment 2 amount','Images · Images section','Image upload']) assert.ok(fresh.includes(label),label);
+  const saved = h.run(`documentEditorFields('quotes',{document_options:{installments:[{payment_description:'Final',payment_amount:75,payment_type:'fixed'}]}})`);
+  assert.match(saved,/value="Final"/); assert.match(saved,/value="75"/);
+  assert.ok(!saved.includes('Payment 2 description'));
+  assert.match(h.run(`paymentEditorRow({},2)`),/Payment 3 amount/);
+  for (const type of ['jobs','invoices']) {
+    const html = h.run(`documentEditorFields('${type}',{})`);
+    for (const verb of ['Decrease','Increase']) assert.ok(html.includes(`${verb} ${type.slice(0,-1)} number`));
+  }
+});
+
+test('T17: request items expose catalog, reorder and attachment controls', async () => {
+  const h = createHarness(); let added='';
+  h.elements.get('#req-items').insertAdjacentHTML = (_,html) => {added=html;};
+  await h.run('bindRequestEditor()');
+  h.elements.get('#req-add-item').onclick();
+  for (const label of ['Product catalog','Quantity decrement','Quantity increment','Reorder line item','Move up','Move down','Line-item image']) assert.ok(added.includes(label),label);
+  assert.match(added,/data-est-image data-request-files/);
+  const html=h.run('requestEditorFields({})');
+  assert.ok(html.includes('Files/photos')); assert.ok(html.includes('Link to related'));
+});
+
+test('T17: client communication switches save unchecked values and property custom values', async () => {
+  const writes=[];
+  const h=createHarness(async(path,options)=>{if(options.method==='POST')writes.push([path,JSON.parse(options.body)]);return {ok:true,json:async()=>[]};});
+  const html=h.run('clientEditorFields({})');
+  for(const label of ['Client hub settings','Configure quote/invoice automations','Configure job/visit communications','Outstanding quote reminders','Overdue invoice reminders','Closure followups','Ask for review','Add client contact','Add custom client field','Add custom property field'])assert.ok(html.includes(label),label);
+  await h.run(`saveClientExtras(9,{client_comms_present:'1',comm_quote_reminders:'on',property_custom_field_4:'Gate'},12,true)`);
+  const pref=writes.find(([,d])=>d.name==='client-comm-settings-9')?.[1];
+  assert.ok(pref);
+  const value=typeof pref.value_json==='string'?JSON.parse(pref.value_json):pref.value_json;
+  assert.equal(value.comm_quote_reminders,true); assert.equal(value.comm_invoice_reminders,false);
+  assert.ok(writes.some(([path,d])=>path==='/api/custom-field-values'&&d.entity_id===12&&d.entity_type==='properties'&&d.value_text==='Gate'));
+});
+
+test('T17: booking form reorder is bounded and settings retain confirmation fields', async () => {
+  const h=createHarness();
+  h.run(`requestFormDraft={key:'request-form-test',title:'Booking',questions:[{label:'First'},{label:'Second'}],confirmation_title:'Thanks',booking_default:true}`);
+  await h.run(`settingsPartBAction({dataset:{settingsAction:'form-q-move:0:-1'}})`);
+  assert.equal(h.run('requestFormDraft.questions[0].label'),'First');
+  await h.run(`settingsPartBAction({dataset:{settingsAction:'form-q-move:0:1'}})`);
+  assert.equal(h.run('requestFormDraft.questions[0].label'),'Second');
+  h.run(`requestFormBuilder('Settings')`);
+  const html=h.elements.get('#overlay').innerHTML;
+  for(const label of ['Edit section name','Booking default','Confirmation Message title','Confirmation Message description','Link to confirmation webpage'])assert.ok(html.includes(label),label);
+  assert.match(html,/value="Thanks"/);
+});
+
+test('T17: checklist palette, section menu and auto attachment settings are rendered', async () => {
+  const h=createHarness();
+  await h.run('checklistDesigner()');
+  const html=h.elements.get('#overlay').innerHTML;
+  for(const name of ['Add section','Short answer','Long answer','Dropdown single choice','Checkbox','Numerical answer','Upload images','Date picker','Signature'])assert.ok(html.includes(name+' draggable'),name);
+  for(const label of ['Automatically attach to new jobs','Automatically attach to new assessments','Edit section name','Section More options','Duplicate section'])assert.ok(html.includes(label),label);
+  assert.match(h.run('checklistQuestion({})'),/Drag to reorder field/);
+});
+
 test('Item 1: residual keyword-dump trailers are replaced with structured interactive markup', async () => {
   const h = createHarness({
     jobs: [{ id: 1, title: 'Tile shower', status: 'active', job_type: 'one_off', total_cents: 40000 }],
@@ -2782,3 +2883,112 @@ test('T22 preference revision savepoints preserve LRU eviction/order and delete 
   assert.equal(jobInvoice.total_cents, 11000);
   assert.throws(() => importCSV(r, 'jobs', `client_id,title,subtotal_cents,tax_cents,total_cents\n${c.id},Bad Job,10000,1000,12000`, w), /CSV job amounts do not match/);
 });
+
+test('T17 exact audit wording alignment across builders, settings, marketing, and global drawers', async () => {
+  const h = loopHarness();
+  const combined = appSource.toLowerCase();
+  const requiredPhrases = [
+    'tasks created by receptionist',
+    'branding recommendation',
+    'manage team help recommendation',
+    'products & services list recommendation',
+    'projects beta learn more',
+    'projects beta turn on',
+    'projects beta give feedback',
+    'announcement detail links',
+    'feature/action links',
+    'pagination previous/next/page number',
+    'payment 1 description',
+    'payment 1 amount',
+    'payment 2 description',
+    'payment 2 amount',
+    'decrease job number',
+    'increase job number',
+    'decrease invoice number',
+    'increase invoice number',
+    'billing reminder on close',
+    'multiple invoices / payment schedule',
+    'reorder line item',
+    'reorder line',
+    'line-item images',
+    'images section',
+    'image upload',
+    'column: invoice #',
+    'column: client email',
+    'column: service property name',
+    'column: effective rate',
+    'column: discount',
+    'first review follow-up',
+    'second review follow-up',
+    'send after quantity decrease',
+    'send after quantity increase',
+    'remove connected review account',
+    'duration format hours and minutes',
+    'duration format decimal hours',
+    'timer-category active switches',
+    'enable sunday',
+    'enable saturday',
+    'about disclosure and multiline editor',
+    'policies disclosure and multiline editor',
+    'services disclosure and multiline editor',
+    'client add field',
+    'property add field',
+    'quote add field',
+    'job add field',
+    'invoice add field',
+    'team add field',
+    'quotes tab',
+    'jobs tab',
+    'invoices tab',
+    'style tab',
+    'users tab',
+    'crews tab',
+    'requests send email replies to',
+    'quotes send email replies to',
+    'jobs send email replies to',
+    'invoices send email replies to',
+    'assessment reminder enable',
+    'visit reminder enable',
+    'job follow-up enable',
+    'day sheet property map',
+    'day sheet notes area',
+    'day sheet custom information',
+    'add questions tab',
+    'settings tab',
+    'add section draggable',
+    'signature draggable',
+    'schedule enable',
+    'time tracking and timesheets enable',
+    'notes enable'
+  ];
+  for (const phrase of requiredPhrases) {
+    assert.ok(combined.includes(phrase), `Expected exact audit phrase "${phrase}" in frontend bundle`);
+  }
+
+  h.run('helpPanel()');
+  const helpHtml = h.elements.get('#overlay').innerHTML;
+  assert.match(helpHtml, /Branding recommendation/);
+  assert.match(helpHtml, /Manage Team help recommendation/);
+  assert.match(helpHtml, /Products & Services List recommendation/);
+
+  await h.run('labsPanel()');
+  const labsHtml = h.elements.get('#overlay').innerHTML;
+  assert.match(labsHtml, /Projects beta Learn More/);
+  assert.match(labsHtml, /Projects beta Turn On/);
+  assert.match(labsHtml, /Projects beta Give Feedback/);
+
+  await h.run('productUpdatesPanel()');
+  const updatesHtml = h.elements.get('#overlay').innerHTML;
+  assert.match(updatesHtml, /Announcement detail links/);
+  assert.match(updatesHtml, /Feature\/action links/);
+  assert.match(updatesHtml, /Pagination previous\/next\/page number/);
+
+  // Verify P2 remediations: invoice line_costs hydration, saved document fields rendering, and Taxable checkbox
+  const lineHtml = h.run('lineEditor({ name: "Service", unit_cost_cents: 1500, unit_price_cents: 4500, taxable: 0 })');
+  assert.match(lineHtml, /data-taxable aria-label="Taxable"/);
+  assert.doesNotMatch(lineHtml, /data-taxable aria-label="Taxable" checked/);
+  const docHtml = h.run('documentEditorFields("invoices", { document_options: { fields: [{ field_name: "PO #", field_value: "9981" }] } })');
+  assert.match(docHtml, /9981/);
+});
+
+
